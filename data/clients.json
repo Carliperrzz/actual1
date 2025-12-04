@@ -1,0 +1,42 @@
+{
+  "120363181313331288@newsletter": {
+    "jid": "120363181313331288@newsletter",
+    "createdAt": 1764004520921,
+    "stageIndex": 0,
+    "lastContactAt": 1764004520924,
+    "ignoreNextFromMe": false,
+    "nextAt": 1764090920925
+  },
+  "120363247633739480@newsletter": {
+    "jid": "120363247633739480@newsletter",
+    "createdAt": 1764004520938,
+    "stageIndex": 0,
+    "lastContactAt": 1764004520938,
+    "ignoreNextFromMe": false,
+    "nextAt": 1764090920939
+  },
+  "120363144038483540@newsletter": {
+    "jid": "120363144038483540@newsletter",
+    "createdAt": 1764004521642,
+    "stageIndex": 0,
+    "lastContactAt": 1764004521643,
+    "ignoreNextFromMe": false,
+    "nextAt": 1764090921644
+  },
+  "120363330022514642@newsletter": {
+    "jid": "120363330022514642@newsletter",
+    "createdAt": 1764004537022,
+    "stageIndex": 0,
+    "lastContactAt": 1764004537023,
+    "ignoreNextFromMe": false,
+    "nextAt": 1764090937023
+  },
+  "5511999606543@s.whatsapp.net": {
+    "jid": "5511999606543@s.whatsapp.net",
+    "createdAt": 1764004697921,
+    "stageIndex": 0,
+    "lastContactAt": 1764004735699,
+    "ignoreNextFromMe": false,
+    "nextAt": 1764091135699
+  }
+}

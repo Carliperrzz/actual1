@@ -1,0 +1,242 @@
+[
+  {
+    "at": 1764004520926,
+    "jid": "120363181313331288@newsletter",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764090920925
+    }
+  },
+  {
+    "at": 1764004520926,
+    "jid": "120363181313331288@newsletter",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004520940,
+    "jid": "120363247633739480@newsletter",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764090920939
+    }
+  },
+  {
+    "at": 1764004520941,
+    "jid": "120363247633739480@newsletter",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004521644,
+    "jid": "120363144038483540@newsletter",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764090921644
+    }
+  },
+  {
+    "at": 1764004521645,
+    "jid": "120363144038483540@newsletter",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004537024,
+    "jid": "120363330022514642@newsletter",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764090937023
+    }
+  },
+  {
+    "at": 1764004537024,
+    "jid": "120363330022514642@newsletter",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004697923,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091097923
+    }
+  },
+  {
+    "at": 1764004697924,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004697932,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091097931
+    }
+  },
+  {
+    "at": 1764004697932,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004698216,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091098215
+    }
+  },
+  {
+    "at": 1764004698216,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004702271,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091102270
+    }
+  },
+  {
+    "at": 1764004702271,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004703304,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091103303
+    }
+  },
+  {
+    "at": 1764004703305,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004707140,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091107140
+    }
+  },
+  {
+    "at": 1764004707141,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004714604,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091114603
+    }
+  },
+  {
+    "at": 1764004714605,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004722355,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091122355
+    }
+  },
+  {
+    "at": 1764004722356,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004727847,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091127842
+    }
+  },
+  {
+    "at": 1764004727849,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004731204,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091131203
+    }
+  },
+  {
+    "at": 1764004731205,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004735025,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091135024
+    }
+  },
+  {
+    "at": 1764004735025,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  },
+  {
+    "at": 1764004735700,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_SCHEDULED",
+    "payload": {
+      "stageIndex": 0,
+      "when": 1764091135699
+    }
+  },
+  {
+    "at": 1764004735700,
+    "jid": "5511999606543@s.whatsapp.net",
+    "type": "FUNIL_START",
+    "payload": {}
+  }
+]
