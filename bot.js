@@ -15,8 +15,8 @@ const {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// Funil de follow-up (em dias)
-const STEPS_DAYS = [3, 5, 7, 15];    // 3d / 5d / 7d / 15d
+// Funil de vendas
+const STEPS_DAYS = [3, 5, 7, 15];      // 3d, 5d, 7d, 15d
 const EXTRA_INTERVAL_DAYS = 30;        // depois a cada 30 dias forever
 
 // Agenda confirmada (recordatórios)
@@ -31,127 +31,179 @@ const CMD_PAUSE = '#falamos no futuro';
 const CMD_STOP = '#okok';
 const CMD_CLIENT = '#cliente';
 
+// Ignorar mensagens antigas (replay do Baileys)
+const RECENT_WINDOW_MS = 10 * 60 * 1000; // 10 minutos
 
-// Número do Carlos para alertas do bot
-const ALERT_JID = '5511999606543@s.whatsapp.net';
+// Arquivos de persistência
+const DATA_FILE = path.join(__dirname, 'clientes.json');
+const MSG_FILE = path.join(__dirname, 'mensajes.json');
+const BLOCK_FILE = path.join(__dirname, 'bloqueados.json');
+const PAUSE_FILE = path.join(__dirname, 'pausados.json');
+const AGENDA_FILE = path.join(__dirname, 'agendas.json');
+const PROGRAM_FILE = path.join(__dirname, 'programados.json');
 
-// Monitor de saúde do funil / bot
-const HEALTH_CHECK_INTERVAL_MS = 5 * 60 * 1000; // a cada 5 minutos
-const HEALTH_OVERDUE_MINUTES = 60;             // considera travado se passar 60min do horário previsto
-let lastHealthAlertAt = 0;
-
-// Ignorar mensagens antigas (replay do WhatsApp ao reconectar)
-const MAX_MESSAGE_AGE_MINUTES = 60;
-
-// Caminhos de arquivos
-const DATA_DIR = path.join(__dirname, 'data');
-const CLIENTS_FILE = path.join(DATA_DIR, 'clientes.json');
-const AGENDAS_FILE = path.join(DATA_DIR, 'agendas.json');
-const BLOCKED_FILE = path.join(DATA_DIR, 'blocked.json');
-const PAUSED_FILE = path.join(DATA_DIR, 'paused.json');
-const SCHEDULED_FILE = path.join(DATA_DIR, 'programados.json');
-const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
-
-// Garante que pasta data existe
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
-
-// =================== ESTADO EM MEMÓRIA ===================
 
 let clients = {};
-let agendas = {};
+let messagesConfig = {};
 let blocked = {};
 let paused = {};
-let scheduled = [];
-let messagesConfig = {};
+let agendas = {};
+let scheduledStarts = {};
 
 let sock = null;
 let isConnected = false;
-let messageQueue = [];
-let sendingNow = false;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
 
-// Para ignorar eco do bot
-const botSentRecently = new Set();
+let messageQueue = []; // itens: { jid, kind: 'funil'|'agenda'|'startFunil', key? }
+let botSentRecently = new Set(); // evita auto-trigger do bot
+let scheduledQueue = new Set();  // controla enfileiramento de mensagens programadas
 
-// =================== HELPERS ===================
+// =================== LOAD/SAVE ===================
 
-function loadJSON(file, defaultValue) {
+function loadJSON(file, fallback = {}) {
+  if (!fs.existsSync(file)) return fallback;
   try {
-    if (!fs.existsSync(file)) return defaultValue;
-    const raw = fs.readFileSync(file, 'utf8');
-    if (!raw.trim()) return defaultValue;
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error('Erro ao ler', file, err);
-    return defaultValue;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    console.error(`Erro ao ler ${path.basename(file)}:`, e);
+    return fallback;
   }
 }
-
 function saveJSON(file, data) {
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
-  } catch (err) {
-    console.error('Erro ao salvar', file, err);
-  }
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
 function loadAll() {
-  clients = loadJSON(CLIENTS_FILE, {});
-  agendas = loadJSON(AGENDAS_FILE, {});
-  blocked = loadJSON(BLOCKED_FILE, {});
-  paused = loadJSON(PAUSED_FILE, {});
-  scheduled = loadJSON(SCHEDULED_FILE, []);
-  messagesConfig = loadJSON(MESSAGES_FILE, {});
+  clients = loadJSON(DATA_FILE, {});
+  messagesConfig = loadJSON(MSG_FILE, defaultMessages());
+  blocked = loadJSON(BLOCK_FILE, {});
+  paused = loadJSON(PAUSE_FILE, {});
+  agendas = loadJSON(AGENDA_FILE, {});
+  scheduledStarts = loadJSON(PROGRAM_FILE, {});
+}
+function saveClients() { saveJSON(DATA_FILE, clients); }
+function saveMessages() { saveJSON(MSG_FILE, messagesConfig); }
+function saveBlocked() { saveJSON(BLOCK_FILE, blocked); }
+function savePaused() { saveJSON(PAUSE_FILE, paused); }
+function saveAgendas() { saveJSON(AGENDA_FILE, agendas); }
+function saveProgramados() { saveJSON(PROGRAM_FILE, scheduledStarts); }
 
-  console.log('✅ CRM carregado. Leads:', Object.keys(clients).length, ', mensagens:', Object.keys(messagesConfig).length);
+// =================== DEFAULT MESSAGES ===================
+
+function defaultMessages() {
+  return {
+    step0:
+      'Olá! Tudo bem? Aqui é da Iron Glass 😊\n' +
+      'Passando só para dar continuidade ao seu atendimento. Se ainda tiver interesse, me chama aqui que eu te ajudo com tudo.',
+    step1:
+      'Oi! Aqui é da Iron Glass novamente 😉\n' +
+      'Queria saber se ainda tem interesse na proteção dos vidros do seu carro. Qualquer dúvida, pode falar comigo por aqui.',
+    step2:
+      'Tudo bem? Aqui é da Iron Glass 🛡️\n' +
+      'Não quero te incomodar, só lembrar que aquela condição especial ainda está disponível. Se fizer sentido para você, me chama.',
+    step3:
+      'Olá! Aqui é da Iron Glass 🚙\n' +
+      'Esse é o último lembrete dessa primeira sequência. Se ainda quiser proteger seu carro, será um prazer te atender.',
+
+    // Seguimento recorrente de interessados (leads) a cada 30 dias
+    extra:
+      'Olá! Tudo bem? Aqui é da Iron Glass 😊\n' +
+      'Só passando a cada 30 dias para saber se já é um bom momento para retomarmos a conversa sobre a proteção dos vidros do seu carro.',
+
+    // Pós-venda: clientes que já instalaram (30 dias após e depois a cada 30 dias)
+    postSale30:
+      'Olá! Aqui é da Iron Glass 🛡️\n' +
+      'Passando para saber se deu tudo certo com a sua proteção e se você conhece alguém que também queira proteger os vidros do carro.\n' +
+      'Sua indicação é muito importante para nós! 😊',
+
+    // Agenda (editáveis no painel)
+    agenda0:
+      '📅 Lembrete Iron Glass: falta 7 dias para seu agendamento.\n' +
+      'Qualquer dúvida antes do dia, estou por aqui. 😉',
+    agenda1:
+      '📅 Lembrete Iron Glass: faltam 3 dias para seu agendamento.\n' +
+      'Se precisar ajustar algo, me avise por aqui.',
+    agenda2:
+      '📅 Lembrete Iron Glass: é amanhã o seu agendamento.\n' +
+      'Te esperamos no horário combinado. 🚗🛡️',
+
+    // Template de confirmação (editável)
+    confirmTemplate:
+      '📅 Confirmação de Agendamento - Iron Glass\n\n' +
+      'Prezado cliente,\n' +
+      'confirmamos seu agendamento para o dia {{DATA}} às {{HORA}}.\n\n' +
+      '🚗 Veículo: {{VEICULO}}\n' +
+      '🛡️ Produto: {{PRODUTO}}\n' +
+      '💰 Valor total: {{VALOR}}\n' +
+      '💵 Sinal recebido: {{SINAL}} ({{PAGAMENTO}})\n\n' +
+      'Agradecemos a confiança em Iron Glass, líder em proteção automotiva premium.\n' +
+      'Nossa equipe estará aguardando na data marcada para realizar o serviço com toda a qualidade e garantia que nos caracterizam.',
+  };
 }
 
-function saveClients() {
-  saveJSON(CLIENTS_FILE, clients);
-}
-
-function saveAgendas() {
-  saveJSON(AGENDAS_FILE, agendas);
-}
-
-function saveBlocked() {
-  saveJSON(BLOCKED_FILE, blocked);
-}
-
-function savePaused() {
-  saveJSON(PAUSED_FILE, paused);
-}
-
-function saveScheduled() {
-  saveJSON(SCHEDULED_FILE, scheduled);
-}
-
-function saveMessages() {
-  saveJSON(MESSAGES_FILE, messagesConfig);
-}
-
-function isInsideWindow(date = new Date()) {
-  const hour = date.getHours();
-  return hour >= START_HOUR && hour < END_HOUR;
-}
-
-function minutesAgo(date) {
-  const now = new Date();
-  return (now - date) / (60 * 1000);
-}
-
-function isTooOld(messageTimestamp) {
-  const msgDate = new Date(messageTimestamp * 1000);
-  return minutesAgo(msgDate) > MAX_MESSAGE_AGE_MINUTES;
-}
+// =================== HELPERS ===================
 
 function markBotSent(jid) {
   botSentRecently.add(jid);
-  setTimeout(() => botSentRecently.delete(jid), 10_000); // 10s pra ignorar eco
+  setTimeout(() => botSentRecently.delete(jid), 2 * 60 * 1000);
 }
 
-// =================== FUNIL / AGENDA / PROGRAMADOS ===================
+function isInsideWindow(ts) {
+  const d = new Date(ts);
+  const h = d.getHours();
+  return h >= START_HOUR && h < END_HOUR;
+}
+
+// aplica variáveis em template
+function applyTemplate(tpl, data) {
+  let out = tpl || '';
+  for (const [k, v] of Object.entries(data || {})) {
+    out = out.replace(new RegExp(`{{${k}}}`, 'g'), v ?? '');
+  }
+  out = out.replace(/{{\w+}}/g, '').replace(/\n\n\n+/g, '\n\n').trim();
+  return out;
+}
+
+// timestamp da msg (Baileys vem em segundos)
+function getMsgMs(msg) {
+  if (msg.messageTimestamp) return Number(msg.messageTimestamp) * 1000;
+  return Date.now();
+}
+
+// detecta confirmação manual no teu texto
+function parseAgendaConfirmation(text) {
+  if (!text) return null;
+  const lower = text.toLowerCase();
+
+  if (
+    !lower.includes('confirmação') &&
+    !lower.includes('confirmacion') &&
+    !lower.includes('agendamento') &&
+    !lower.includes('agenda')
+  ) return null;
+
+  // ✅ regex corrigida para Node 22
+  const dateMatch = lower.match(/(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
+  if (!dateMatch) return null;
+
+  let d = dateMatch[1], m = dateMatch[2], y = dateMatch[3];
+  if (y.length === 2) y = '20' + y;
+
+  const timeMatch = lower.match(/(\d{1,2})\s*[:h]\s*(\d{2})/i);
+  let hh = '09', mm = '00';
+  if (timeMatch) {
+    hh = String(timeMatch[1]).padStart(2, '0');
+    mm = String(timeMatch[2]).padStart(2, '0');
+  }
+
+  const iso = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}T${hh}:${mm}:00`;
+  const ts = new Date(iso).getTime();
+  if (isNaN(ts)) return null;
+  return ts;
+}
+
+// =================== FUNIL ===================
 
 function startFollowUp(jid) {
   if (blocked[jid]) return; // nunca reinicia pra bloqueado definitivo
@@ -188,168 +240,119 @@ function startPostSaleMonthly(jid) {
     savePaused();
   }
 
-  console.log('[POS-VENDA] Ativado ciclo mensal para', jid);
+  console.log('[PÓS-VENDA] Seguimento mensal ativado para', jid, '-> próxima em', EXTRA_INTERVAL_DAYS, 'dias');
 }
 
-function blockFollowUp(jid, reason = 'MANUAL') {
-  blocked[jid] = { reason, at: Date.now() };
-  delete clients[jid];
-  saveBlocked();
-  saveClients();
-
-  console.log('[FUNIL] BLOQUEADO para', jid, 'motivo:', reason);
-}
-
-function pauseFollowUp(jid) {
-  paused[jid] = { at: Date.now() };
-  savePaused();
-  console.log('[FUNIL] PAUSADO para', jid);
-}
-
-function resumeFollowUp(jid) {
-  if (!paused[jid]) return;
-  delete paused[jid];
-  savePaused();
-  console.log('[FUNIL] RESUMIDO para', jid);
-}
-
-function addAgenda(jid, timestamp) {
-  if (!agendas[jid]) agendas[jid] = [];
-  agendas[jid].push({ at: timestamp, notified: false });
-  saveAgendas();
-  console.log('[AGENDA] Agendada para', new Date(timestamp).toLocaleString(), '->', jid);
-}
-
-function scheduleMessage(jid, text, timestamp) {
-  scheduled.push({
-    jid,
-    text,
-    at: timestamp,
-    sent: false,
-  });
-  saveScheduled();
-  console.log('[PROGRAMADO] Mensagem programada para', jid, 'em', new Date(timestamp).toLocaleString());
-}
-
-// =================== FILA DE ENVIO ===================
-
-function enqueueMessage(jid, kind, payload = {}) {
-  messageQueue.push({ jid, kind, ...payload });
-  console.log('[QUEUE] Mensagem enfileirada:', { jid, kind });
-}
-
-async function startMessageSender() {
-  if (sendingNow) return;
-  sendingNow = true;
-
-  while (true) {
-    try {
-      if (!isConnected || !sock) {
-        await new Promise(res => setTimeout(res, 3000));
-        continue;
-      }
-
-      const item = messageQueue.shift();
-      if (!item) {
-        await new Promise(res => setTimeout(res, 1000));
-        continue;
-      }
-
-      const { jid, kind, text } = item;
-
-      if (!isInsideWindow(new Date())) {
-        console.log('[SENDER] Fora da janela de envio, recolocando na fila ->', jid);
-        messageQueue.push(item);
-        await new Promise(res => setTimeout(res, 60 * 1000));
-        continue;
-      }
-
-      if (kind === 'simple' && text) {
-        markBotSent(jid);
-        await sock.sendMessage(jid, { text });
-        console.log('[SENDER] Enviado (simple) para', jid);
-        await new Promise(res => setTimeout(res, 2000));
-        continue;
-      }
-
-      if (kind === 'funil') {
-        const c = clients[jid];
-        if (!c) continue;
-        if (blocked[jid]) continue;
-        if (paused[jid]) continue;
-
-        const now = Date.now();
-        const stepIndex = c.stepIndex ?? 0;
-
-        let msgKey;
-        if (stepIndex < STEPS_DAYS.length) {
-          msgKey = `step${stepIndex + 1}`; // step1, step2, step3, step4 ...
-        } else {
-          msgKey = 'postSale30'; // pós-venda mensal
-        }
-
-        const texto =
-          messagesConfig[msgKey] ||
-          (c.isClient ? messagesConfig.postSale30 : null) ||
-          messagesConfig.extra ||
-          'Olá! Tudo bem?';
-
-        // Antes: c.ignoreNextFromMe = true; (isso travava o funil se algo desse errado)
-        // Agora confiamos apenas em botSentRecently para ignorar eco do bot
-        markBotSent(jid);
-        await sock.sendMessage(jid, { text: texto });
-
-        const sentAt = Date.now();
-        c.lastContact = sentAt;
-
-        if (stepIndex < STEPS_DAYS.length) {
-          c.stepIndex = stepIndex + 1;
-          if (stepIndex + 1 < STEPS_DAYS.length) {
-            c.nextFollowUpAt = sentAt + STEPS_DAYS[stepIndex + 1] * DAY_MS;
-          } else {
-            c.isClient = true;
-            c.stepIndex = STEPS_DAYS.length;
-            c.nextFollowUpAt = sentAt + EXTRA_INTERVAL_DAYS * DAY_MS;
-          }
-        } else {
-          c.isClient = true;
-          c.stepIndex = STEPS_DAYS.length;
-          c.nextFollowUpAt = sentAt + EXTRA_INTERVAL_DAYS * DAY_MS;
-        }
-
-        clients[jid] = c;
-        saveClients();
-
-        console.log('[FUNIL] Mensagem enviada para', jid, '-> stepIndex', c.stepIndex);
-        await new Promise(res => setTimeout(res, 3000));
-        continue;
-      }
-
-      console.log('[SENDER] Tipo de mensagem desconhecido:', kind);
-    } catch (err) {
-      console.error('[SENDER] Erro ao enviar mensagem:', err);
-      await new Promise(res => setTimeout(res, 5000));
-    }
+function stopFollowUp(jid) {
+  if (clients[jid]) {
+    delete clients[jid];
+    saveClients();
   }
 }
 
-// =================== AGENDADOR ===================
+function pauseFollowUp(jid) {
+  paused[jid] = { pausedAt: Date.now() };
+  savePaused();
+
+  // remove qualquer follow-up já enfileirado para esse contato
+  messageQueue = messageQueue.filter(item => !(item.jid === jid && item.kind === 'funil'));
+
+  stopFollowUp(jid);
+  console.log('[FUNIL] Pausado para', jid);
+}
+
+function blockFollowUp(jid, reason = 'STOP') {
+  // Marca como bloqueado DEFINITIVO: não entra mais em nenhum fluxo (funil, agenda, mensal, programados)
+  blocked[jid] = { blockedAt: Date.now(), reason };
+  saveBlocked();
+
+  // Pausa e remove funil
+  pauseFollowUp(jid);
+  stopFollowUp(jid);
+
+  // Cancela todos os lembretes de agenda
+  cancelAgenda(jid);
+
+  // Cancela qualquer mensagem inicial programada
+  if (scheduledStarts[jid]) {
+    delete scheduledStarts[jid];
+    saveProgramados();
+    scheduledQueue.delete(jid);
+  }
+
+  // Limpa qualquer item já enfileirado na fila
+  messageQueue = messageQueue.filter(m => m.jid !== jid);
+
+  console.log('[FUNIL] Bloqueado definitivo para', jid);
+}
+
+// =================== AGENDA ===================
+
+function scheduleAgenda(jid, appointmentTs, meta) {
+  const now = Date.now();
+  const list = [];
+  const payload = meta || {};
+
+  // Sempre que agenda é criada, paramos o funil normal e limpamos fila/programados
+  stopFollowUp(jid);
+
+  // remove qualquer follow-up já enfileirado para esse contato
+  messageQueue = messageQueue.filter(item => !(item.jid === jid && item.kind === 'funil'));
+
+  // se havia mensagem inicial programada, é descartada ao entrar em agenda
+  if (scheduledStarts[jid]) {
+    delete scheduledStarts[jid];
+    saveProgramados();
+    scheduledQueue.delete(jid);
+  }
+
+  AGENDA_OFFSETS_DAYS.forEach((days, idx) => {
+    const at = appointmentTs - days * DAY_MS;
+    if (at > now) {
+      list.push({
+        at,
+        key: `agenda${idx}`,
+        data: payload, // dados da confirmação (DATA, HORA, VEICULO, etc.)
+      });
+    }
+  });
+
+  if (list.length === 0) {
+    console.log('[AGENDA] Nenhum lembrete futuro para programar ->', jid);
+    return;
+  }
+
+  agendas[jid] = list.sort((a, b) => a.at - b.at);
+  saveAgendas();
+  console.log('[AGENDA] Lembretes programados para', jid, '->', list.map(x => x.key).join(', '));
+}
+
+function cancelAgenda(jid) {
+  if (!jid) return;
+
+  if (agendas[jid]) {
+    delete agendas[jid];
+    saveAgendas();
+  }
+
+  // ✅ remove lembretes já enfileirados desse cliente
+  messageQueue = messageQueue.filter(m => !(m.jid === jid && m.kind === 'agenda'));
+
+  console.log('[AGENDA] Agenda cancelada (fila limpa) para', jid);
+}
+
+// =================== SCHEDULER ===================
 
 function startScheduleChecker() {
   setInterval(() => {
-    if (!isConnected || !sock) return;
-    if (!isInsideWindow(new Date())) return;
-
     const now = Date.now();
 
-    // Funil
+    // funil
     for (const [jid, c] of Object.entries(clients)) {
-      if (!c || !c.nextFollowUpAt) continue;
       if (blocked[jid]) continue;
       if (paused[jid]) continue;
-
-      const diff = now - c.nextFollowUpAt;
-      if (diff >= 0 && diff < 60 * 60 * 1000) {
+      if (!c.nextFollowUpAt) continue;
+      if (now >= c.nextFollowUpAt) {
         const already = messageQueue.some(m => m.jid === jid && m.kind === 'funil');
         if (!already) {
           messageQueue.push({ jid, kind: 'funil' });
@@ -362,35 +365,381 @@ function startScheduleChecker() {
     for (const [jid, arr] of Object.entries(agendas)) {
       if (!Array.isArray(arr)) continue;
       for (const item of arr) {
-        if (item.sent) continue;
-        if (now >= item.at && now - item.at < 60 * 60 * 1000) {
-          const msg = messagesConfig.agendaReminder || 'Lembrando da sua agenda com a Iron Glass!';
-          enqueueMessage(jid, 'simple', { text: msg });
-          item.sent = true;
+        if (now >= item.at) {
+          const already = messageQueue.some(m => m.jid === jid && m.kind === 'agenda' && m.key === item.key);
+          if (!already) {
+            messageQueue.push({ jid, kind: 'agenda', key: item.key });
+            console.log('[QUEUE] Agenda enfileirada para', jid, item.key);
+          }
         }
       }
     }
-    saveAgendas();
 
-    // programados
-    for (const item of scheduled) {
-      if (item.sent) continue;
-      if (now >= item.at && now - item.at < 60 * 60 * 1000) {
-        enqueueMessage(item.jid, 'simple', { text: item.text });
-        item.sent = true;
+    // mensagens iniciais programadas (primeiro contato)
+    for (const [jid, s] of Object.entries(scheduledStarts || {})) {
+      if (!s || !s.at) continue;
+
+      if (now >= s.at) {
+        const already = messageQueue.some(m => m.jid === jid && m.kind === 'startFunil');
+        if (!already && !scheduledQueue.has(jid)) {
+          messageQueue.push({ jid, kind: 'startFunil' });
+          scheduledQueue.add(jid);
+          console.log('[QUEUE] Mensagem inicial programada enfileirada para', jid);
+        }
       }
     }
-    saveScheduled();
+
   }, 60 * 1000);
 }
 
-// =================== WHATSAPP (BAILEYS) ===================
+// =================== SENDER ===================
+
+let sendingNow = false;
+
+function startMessageSender() {
+  setInterval(async () => {
+    if (!sock || sendingNow) return;
+    const item = messageQueue.shift();
+    if (!item) return;
+
+    // ✅ se não está conectado, devolve pra fila e espera
+    if (!isConnected) {
+      messageQueue.unshift(item);
+      return;
+    }
+
+    const now = Date.now();
+    if (!isInsideWindow(now)) {
+      messageQueue.push(item);
+      return;
+    }
+
+    sendingNow = true;
+
+    // jitter aleatório 5–55s
+    const jitterMs = 5000 + Math.floor(Math.random() * 50000);
+    await new Promise(r => setTimeout(r, jitterMs));
+
+    try {
+      const { jid, kind, key } = item;
+
+      if (kind === 'funil') {
+        const c = clients[jid];
+        if (!c) { sendingNow = false; return; }
+
+        let msgKey = 'extra';
+
+        // Cliente pós-venda: usa sempre a mensagem específica de indicação
+        if (c.isClient) {
+          msgKey = 'postSale30';
+        } else if (c.stepIndex >= 0 && c.stepIndex <= STEPS_DAYS.length - 1) {
+          msgKey = `step${c.stepIndex}`;
+        }
+
+        const texto =
+          messagesConfig[msgKey] ||
+          (c.isClient ? messagesConfig.postSale30 : null) ||
+          messagesConfig.extra ||
+          'Olá! Tudo bem?';
+
+        c.ignoreNextFromMe = true;
+        saveClients();
+
+        markBotSent(jid);
+        await sock.sendMessage(jid, { text: texto });
+
+        const sentAt = Date.now();
+        c.lastContact = sentAt;
+
+        if (c.isClient) {
+          // fluxo mensal pós-venda: sempre a cada 30 dias
+          c.stepIndex = STEPS_DAYS.length;
+          c.nextFollowUpAt = sentAt + EXTRA_INTERVAL_DAYS * DAY_MS;
+          console.log('[PÓS-VENDA] Follow-up mensal enviado para', jid, '-> próxima em', EXTRA_INTERVAL_DAYS, 'dias');
+        } else if (c.stepIndex < STEPS_DAYS.length - 1) {
+          c.stepIndex += 1;
+          const dias = STEPS_DAYS[c.stepIndex];
+          c.nextFollowUpAt = sentAt + dias * DAY_MS;
+          console.log('[FUNIL] Follow-up enviado para', jid, '-> próxima etapa em', dias, 'dias');
+        } else {
+          c.stepIndex += 1;
+          c.nextFollowUpAt = sentAt + EXTRA_INTERVAL_DAYS * DAY_MS;
+          console.log('[FUNIL] Follow-up enviado para', jid, '-> agora será a cada', EXTRA_INTERVAL_DAYS, 'dias');
+        }
+
+        saveClients();
+      }
+
+      if (kind === 'agenda') {
+        const arr = agendas[jid];
+
+        if (!Array.isArray(arr)) {
+          console.log('[AGENDA] Ignorado lembrete porque agenda não existe mais ->', jid, key);
+          return;
+        }
+
+        const item = arr.find(x => x.key === key);
+        if (!item) {
+          console.log('[AGENDA] Ignorado lembrete porque chave não encontrada ->', jid, key);
+          return;
+        }
+
+        const baseText = messagesConfig[key] || '📅 Lembrete do seu agendamento Iron Glass.';
+
+        // Monta dados para o template
+        const data = Object.assign({}, item.data || {});
+
+        // Se não tiver DATA/HORA salvos, tenta reconstruir a partir do horário do lembrete
+        if ((!data.DATA || !data.HORA) && item.at) {
+          let offsetDays = null;
+          if (key === 'agenda0') offsetDays = 7;
+          else if (key === 'agenda1') offsetDays = 3;
+          else if (key === 'agenda2') offsetDays = 1;
+
+          if (offsetDays != null) {
+            const apptTs = item.at + offsetDays * DAY_MS;
+            const d = new Date(apptTs);
+            const dd = String(d.getDate()).padStart(2, '0');
+            const mm = String(d.getMonth() + 1).padStart(2, '0');
+            const yyyy = d.getFullYear();
+            const hh = String(d.getHours()).padStart(2, '0');
+            const min = String(d.getMinutes()).padStart(2, '0');
+
+            data.DATA = `${dd}/${mm}/${yyyy}`;
+            data.HORA = `${hh}:${min}`;
+          }
+        }
+
+        const texto = applyTemplate(baseText, data);
+
+        markBotSent(jid);
+        await sock.sendMessage(jid, { text: texto });
+
+        agendas[jid] = arr.filter(x => x.key !== key);
+        if (agendas[jid].length === 0) delete agendas[jid];
+        saveAgendas();
+
+        console.log('[AGENDA] Lembrete enviado ->', jid, key);
+      }
+
+      if (kind === 'startFunil') {
+        const data = scheduledStarts[jid];
+
+        if (!data || !data.at) {
+          console.log('[PROGRAM] Nenhum dado encontrado para mensagem programada ->', jid);
+          scheduledQueue.delete(jid);
+          return;
+        }
+
+        if (blocked[jid]) {
+          console.log('[PROGRAM] Cliente bloqueado; ignorando mensagem programada ->', jid);
+          delete scheduledStarts[jid];
+          saveProgramados();
+          scheduledQueue.delete(jid);
+          return;
+        }
+
+        const texto =
+          (data.text && data.text.trim()) ||
+          messagesConfig.step0 ||
+          'Olá! Tudo bem?';
+
+        markBotSent(jid);
+        await sock.sendMessage(jid, { text: texto });
+        console.log('[PROGRAM] Mensagem inicial programada enviada ->', jid);
+
+        // depois da mensagem programada, entra no funil normal
+        startFollowUp(jid);
+
+        delete scheduledStarts[jid];
+        saveProgramados();
+        scheduledQueue.delete(jid);
+      }
+
+
+    } catch (err) {
+      console.error('[ERRO] Ao enviar mensagem para', item.jid, err?.message || err);
+      // devolve pra fila pra tentar depois
+      messageQueue.unshift(item);
+    } finally {
+      sendingNow = false;
+    }
+  }, 60 * 1000);
+}
+
+// =================== WHATSAPP HANDLER ===================
+
+function setupMessageHandler() {
+  if (!sock) return;
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg || !msg.message) return;
+
+    const remoteJid = msg.key.remoteJid;
+    const fromMe = msg.key.fromMe;
+
+    // ✅ normaliza JID quando WhatsApp manda @lid (Linked ID)
+    let jid = remoteJid;
+    if (remoteJid && remoteJid.endsWith('@lid')) {
+      const real = msg.key.senderPn || msg.key.participant;
+      if (real && real.endsWith('@s.whatsapp.net')) jid = real;
+    }
+
+    if (
+      !remoteJid ||
+      remoteJid === 'status@broadcast' ||
+      remoteJid.endsWith('@g.us') ||
+      remoteJid.endsWith('@newsletter')
+    ) return;
+
+    // ✅ IGNORAR HISTÓRICO / REPLAY
+    const msgMs = getMsgMs(msg);
+    if (Date.now() - msgMs > RECENT_WINDOW_MS) {
+      console.log('[HIST] Ignorando msg antiga ->', jid);
+      return;
+    }
+
+    const body =
+      msg.message.conversation ||
+      msg.message.extendedTextMessage?.text ||
+      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
+      '';
+
+    const lower = (body || '').toLowerCase();
+    const c = clients[jid];
+
+    // --------- MINHA MSG (SOMENTE VOCÊ CONTROLA STOP/PAUSE/AGENDA) ---------
+    if (fromMe) {
+      if (botSentRecently.has(jid)) {
+        console.log('[BOT MSG] Ignorada (botSentRecently) ->', jid);
+        return;
+      }
+
+      // comandos manuais SEMPRE antes do ignoreNextFromMe
+      if (lower.includes(CMD_STOP)) {
+        if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
+        blockFollowUp(jid, 'MANUAL_STOP');
+        return;
+      }
+      if (lower.includes(CMD_PAUSE)) {
+        if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
+        pauseFollowUp(jid);
+        return;
+      }
+
+      if (lower.includes(CMD_CLIENT)) {
+        if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
+
+        // Pós-venda: marca como cliente, cancela agenda e funil normal e ativa fluxo mensal
+        cancelAgenda(jid);
+
+        // remove qualquer follow-up de funil já enfileirado
+        messageQueue = messageQueue.filter(item => !(item.jid === jid && item.kind === 'funil'));
+
+        // descarta mensagem inicial programada, se existir
+        if (scheduledStarts[jid]) {
+          delete scheduledStarts[jid];
+          saveProgramados();
+          scheduledQueue.delete(jid);
+        }
+
+        startPostSaleMonthly(jid);
+        console.log('[PÓS-VENDA] Marcado como cliente via comando #cliente ->', jid);
+        return;
+      }
+
+      // detecta confirmação manual de agenda
+      const apptTs = parseAgendaConfirmation(body);
+      if (apptTs) {
+        if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
+        scheduleAgenda(jid, apptTs);
+        stopFollowUp(jid);
+        console.log('[AGENDA] Confirmação detectada na sua msg -> lembretes criados', jid);
+        return;
+      }
+
+      // ignora eco do bot (funil enviado)
+      if (c && c.ignoreNextFromMe) {
+        c.ignoreNextFromMe = false;
+        saveClients();
+        console.log('[BOT MSG] Ignorada para não reiniciar funil ->', jid);
+        return;
+      }
+
+      if (!blocked[jid]) {
+        // Se o cliente tem agenda ativa, NÃO reinicia funil normal.
+        if (agendas[jid] && Array.isArray(agendas[jid]) && agendas[jid].length > 0) {
+          console.log('[MINHA MSG] Cliente com agenda ativa; não reinicia funil ->', jid);
+        } else {
+          console.log('[MINHA MSG] Reiniciando funil para', jid);
+          startFollowUp(jid);
+        }
+      }
+      return;
+    }
+
+    // --------- MSG DO CLIENTE ---------
+    console.log('[CLIENTE]', jid, '->', body);
+
+    // ❌ REMOVIDO auto-stop por palavras do cliente (para não sair por acidente)
+
+    if (blocked[jid]) return;
+
+    // PAUSA de 72h: enquanto durar a janela, não reinicia funil nem entra em novos fluxos
+    if (paused[jid]) {
+      const pausedAt = paused[jid].pausedAt || paused[jid];
+      const PAUSE_MS = 72 * 60 * 60 * 1000; // 72 horas
+      const until = pausedAt + PAUSE_MS;
+
+      if (Date.now() < until) {
+        console.log('[PAUSE] Cliente em pausa até', new Date(until).toISOString(), '-> não reinicia funil', jid);
+        return;
+      } else {
+        delete paused[jid];
+        savePaused();
+        console.log('[PAUSE] Pausa expirada, cliente volta ao funil ->', jid);
+      }
+    }
+
+    const c2 = clients[jid];
+
+    // Se for cliente pós-venda, não reinicia funil de pré-venda ao receber mensagem;
+    // apenas atualiza último contato e mantém o fluxo mensal.
+    if (c2 && c2.isClient) {
+      c2.lastContact = Date.now();
+      saveClients();
+      console.log('[PÓS-VENDA] Mensagem recebida de cliente; mantém apenas fluxo mensal ->', jid);
+      return;
+    }
+
+    startFollowUp(jid);
+  });
+}
+
+// =================== START BOT / QR ===================
+
+async function cleanupSocket() {
+  try {
+    if (sock?.ev) sock.ev.removeAllListeners();
+    if (sock?.ws) sock.ws.close();
+    if (sock?.end) sock.end();
+  } catch (_) {}
+  sock = null;
+  isConnected = false;
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectAttempts += 1;
+  const delay = Math.min(30000, 3000 * reconnectAttempts); // 3s, 6s, 9s ... até 30s
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    await startBot();
+  }, delay);
+}
 
 async function startBot() {
-  const logger = P({ level: 'info' });
-  const { state, saveCreds } = await useMultiFileAuthState('auth');
-
- {
   try {
     await cleanupSocket();
 
@@ -1011,92 +1360,11 @@ app.post('/admin/program/delete', (req, res) => {
   res.redirect('/admin');
 });
 
-
-
-// =================== HEALTH MONITOR (ALERTAS PARA CARLOS) ===================
-
-async function sendHealthAlert(text) {
-  try {
-    if (!sock || !isConnected) {
-      console.log('[HEALTH] Não foi possível enviar alerta (bot desconectado).');
-      return;
-    }
-    if (!ALERT_JID) {
-      console.log('[HEALTH] ALERT_JID não configurado.');
-      return;
-    }
-
-    markBotSent(ALERT_JID);
-    await sock.sendMessage(ALERT_JID, { text });
-    console.log('[HEALTH] Alerta enviado para', ALERT_JID);
-  } catch (err) {
-    console.error('[HEALTH] Erro ao enviar alerta:', err);
-  }
-}
-
-function startHealthMonitor() {
-  setInterval(async () => {
-    const now = Date.now();
-
-    // Alerta se não estiver conectado
-    if (!isConnected) {
-      if (now - lastHealthAlertAt > HEALTH_CHECK_INTERVAL_MS) {
-        lastHealthAlertAt = now;
-        await sendHealthAlert(
-          '⚠️ ALERTA IRON GLASS BOT\n\n' +
-          'O bot não está conectado ao WhatsApp neste momento. ' +
-          'Verifique a sessão no celular e os logs do Railway.'
-        );
-      }
-      return;
-    }
-
-    // Verifica contatos com follow-up atrasado há muito tempo
-    const threshold = HEALTH_OVERDUE_MINUTES * 60 * 1000;
-    const overdue = [];
-
-    for (const [jid, c] of Object.entries(clients || {})) {
-      if (!c || !c.nextFollowUpAt) continue;
-      if (blocked[jid]) continue;
-      if (paused[jid]) continue;
-
-      const diff = now - c.nextFollowUpAt;
-      if (diff > threshold) {
-        // Se lastContact é anterior ao horário planejado, significa que o follow-up não rodou
-        if (!c.lastContact || c.lastContact < c.nextFollowUpAt) {
-          overdue.push({ jid, diff });
-        }
-      }
-    }
-
-    if (overdue.length > 0 && now - lastHealthAlertAt > threshold) {
-      lastHealthAlertAt = now;
-      const sample = overdue[0];
-      const minutes = Math.round(sample.diff / 60000);
-      let phone = sample.jid
-        .replace('@s.whatsapp.net', '')
-        .replace('@lid', '')
-        .replace('@newsletter', '');
-
-      if (phone.startsWith('55')) phone = phone.slice(2);
-
-      const msg =
-        '⚠️ ALERTA IRON GLASS BOT\n\n' +
-        `Detectei ${overdue.length} contato(s) com follow-up atrasado há mais de ${HEALTH_OVERDUE_MINUTES} minutos.\n` +
-        `Exemplo: ${phone} (atraso de ~${minutes} min).\n\n` +
-        'Isso pode indicar que o funil travou. Verifique o painel e os logs do Railway.';
-
-      await sendHealthAlert(msg);
-    }
-  }, HEALTH_CHECK_INTERVAL_MS);
-}
-
 // =================== START ===================
 
 loadAll();
 startScheduleChecker();
 startMessageSender();
-startHealthMonitor();
 startBot();
 
 const PORT = process.env.PORT || 3000;
