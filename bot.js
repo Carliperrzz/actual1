@@ -22,9 +22,11 @@ const EXTRA_INTERVAL_DAYS = 30;        // depois a cada 30 dias forever
 // Agenda confirmada (recordatórios)
 const AGENDA_OFFSETS_DAYS = [7, 3, 1]; // 7d / 3d / 1d antes
 
-// Janela de envio
+// Janela de envio (horário São Paulo)
 const START_HOUR = 9;
 const END_HOUR = 22;
+// São Paulo = UTC-3
+const TIMEZONE_OFFSET = -3;
 
 // Comandos teus (discretos) — SOMENTE VOCÊ CONTROLA
 const CMD_PAUSE = '#falamos no futuro';
@@ -41,7 +43,6 @@ const BLOCK_FILE = path.join(__dirname, 'bloqueados.json');
 const PAUSE_FILE = path.join(__dirname, 'pausados.json');
 const AGENDA_FILE = path.join(__dirname, 'agendas.json');
 const PROGRAM_FILE = path.join(__dirname, 'programados.json');
-
 
 let clients = {};
 let messagesConfig = {};
@@ -149,10 +150,17 @@ function markBotSent(jid) {
   setTimeout(() => botSentRecently.delete(jid), 2 * 60 * 1000);
 }
 
+// 👉 Ajustado para horário de São Paulo (UTC-3)
 function isInsideWindow(ts) {
   const d = new Date(ts);
-  const h = d.getHours();
-  return h >= START_HOUR && h < END_HOUR;
+
+  // hora do servidor em UTC
+  const utcHour = d.getUTCHours();
+
+  // converte para horário de São Paulo
+  const hourSP = (utcHour + TIMEZONE_OFFSET + 24) % 24;
+
+  return hourSP >= START_HOUR && hourSP < END_HOUR;
 }
 
 // aplica variáveis em template
@@ -183,7 +191,7 @@ function parseAgendaConfirmation(text) {
     !lower.includes('agenda')
   ) return null;
 
-  // ✅ regex corrigida para Node 22
+  // regex compatível com Node 22
   const dateMatch = lower.match(/(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
   if (!dateMatch) return null;
 
@@ -335,7 +343,7 @@ function cancelAgenda(jid) {
     saveAgendas();
   }
 
-  // ✅ remove lembretes já enfileirados desse cliente
+  // remove lembretes já enfileirados desse cliente
   messageQueue = messageQueue.filter(m => !(m.jid === jid && m.kind === 'agenda'));
 
   console.log('[AGENDA] Agenda cancelada (fila limpa) para', jid);
@@ -402,7 +410,7 @@ function startMessageSender() {
     const item = messageQueue.shift();
     if (!item) return;
 
-    // ✅ se não está conectado, devolve pra fila e espera
+    // se não está conectado, devolve pra fila e espera
     if (!isConnected) {
       messageQueue.unshift(item);
       return;
@@ -442,6 +450,7 @@ function startMessageSender() {
           messagesConfig.extra ||
           'Olá! Tudo bem?';
 
+        // marca que a próxima mensagem "fromMe" é eco do bot, não tua
         c.ignoreNextFromMe = true;
         saveClients();
 
@@ -556,7 +565,6 @@ function startMessageSender() {
         scheduledQueue.delete(jid);
       }
 
-
     } catch (err) {
       console.error('[ERRO] Ao enviar mensagem para', item.jid, err?.message || err);
       // devolve pra fila pra tentar depois
@@ -579,7 +587,7 @@ function setupMessageHandler() {
     const remoteJid = msg.key.remoteJid;
     const fromMe = msg.key.fromMe;
 
-    // ✅ normaliza JID quando WhatsApp manda @lid (Linked ID)
+    // normaliza JID quando WhatsApp manda @lid (Linked ID)
     let jid = remoteJid;
     if (remoteJid && remoteJid.endsWith('@lid')) {
       const real = msg.key.senderPn || msg.key.participant;
@@ -593,7 +601,7 @@ function setupMessageHandler() {
       remoteJid.endsWith('@newsletter')
     ) return;
 
-    // ✅ IGNORAR HISTÓRICO / REPLAY
+    // IGNORAR HISTÓRICO / REPLAY
     const msgMs = getMsgMs(msg);
     if (Date.now() - msgMs > RECENT_WINDOW_MS) {
       console.log('[HIST] Ignorando msg antiga ->', jid);
@@ -682,7 +690,7 @@ function setupMessageHandler() {
     // --------- MSG DO CLIENTE ---------
     console.log('[CLIENTE]', jid, '->', body);
 
-    // ❌ REMOVIDO auto-stop por palavras do cliente (para não sair por acidente)
+    // REMOVIDO auto-stop por palavras do cliente (para não sair por acidente)
 
     if (blocked[jid]) return;
 
@@ -799,7 +807,7 @@ app.use(express.json());
 
 function htmlEscape(str) {
   if (!str) return '';
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;/g').replace(/>/g, '&gt;');
 }
 
 function renderAgendasList() {
@@ -868,7 +876,6 @@ function renderAgendasList() {
       </table>
     </div>`;
 }
-
 
 function renderProgramList() {
   const items = [];
@@ -1019,7 +1026,7 @@ app.get('/admin', (req, res) => {
     <h1><span class="logo">IG</span>Painel do Bot</h1>
     <div class="subtitle">
       Funil automático no topo. Confirmação de agenda abaixo.
-      <br/><small>Envio somente entre ${START_HOUR}:00 e ${END_HOUR}:00.</small>
+      <br/><small>Envio somente entre ${START_HOUR}:00 e ${END_HOUR}:00 (horário São Paulo).</small>
     </div>
 
     <form method="POST" action="/admin/mensajes">
@@ -1245,7 +1252,6 @@ app.post('/admin/mensajes', (req, res) => {
   messagesConfig.extra = req.body.extra || messagesConfig.extra;
   messagesConfig.postSale30 = req.body.postSale30 || messagesConfig.postSale30;
 
-
   messagesConfig.agenda0 = req.body.agenda0 || messagesConfig.agenda0;
   messagesConfig.agenda1 = req.body.agenda1 || messagesConfig.agenda1;
   messagesConfig.agenda2 = req.body.agenda2 || messagesConfig.agenda2;
@@ -1268,7 +1274,6 @@ app.post('/admin/agenda', async (req, res) => {
   const jid = phone.startsWith('55') ? `${phone}@s.whatsapp.net` : `55${phone}@s.whatsapp.net`;
   const apptTs = new Date(`${date}T${time}:00`).getTime();
 
-  // Monta dados completos da agenda (iguais ao template de confirmação)
   const d = new Date(apptTs);
   const dd = String(d.getDate()).padStart(2,'0');
   const mm = String(d.getMonth()+1).padStart(2,'0');
@@ -1286,10 +1291,8 @@ app.post('/admin/agenda', async (req, res) => {
     PAGAMENTO: req.body.pagamento || ''
   };
 
-  // Sempre programa lembretes já com os dados salvos
   scheduleAgenda(jid, apptTs, data);
 
-  // Opcionalmente envia confirmação agora
   if (req.body.sendConfirm) {
     const text = applyTemplate(messagesConfig.confirmTemplate, data);
 
@@ -1313,7 +1316,6 @@ app.post('/admin/agenda/delete', (req, res) => {
   cancelAgenda(jid);
   res.redirect('/admin');
 });
-
 
 // programar primeira mensagem do funil via painel
 app.post('/admin/program', (req, res) => {
