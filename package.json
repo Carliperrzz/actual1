@@ -11,6 +11,6 @@
     "pino": "*",
     "express": "*",
     "qrcode-terminal": "*",
-    "socket.io": "*"
+    "socket.io": "^4.8.1"
   }
 }
