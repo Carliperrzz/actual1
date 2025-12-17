@@ -783,7 +783,7 @@ async function startBot() {
   try {
     await cleanupSocket();
 
-    const { state, saveCreds } = await useMultiFileAuthState('auth');
+    const { state, saveCreds } = await useMultiFileAuthState(process.env.AUTH_DIR || 'auth');
     const { version } = await fetchLatestBaileysVersion();
 
     sock = makeWASocket({
