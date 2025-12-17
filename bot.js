@@ -866,6 +866,8 @@ io.on('connection', (socket) => {
       lastFromMe: (c.messages && c.messages.length) ? !!c.messages[c.messages.length-1].fromMe : false,
       lastTs: (c.messages && c.messages.length) ? c.messages[c.messages.length-1].ts : (c.updatedAt || 0),
     });
+  });
+
   socket.on('toggle_pin', (jid) => {
     try {
       if (!jid) return;
@@ -886,8 +888,6 @@ io.on('connection', (socket) => {
       });
       io.emit('chats', listChats());
     } catch (e) {}
-  });
-
   });
 
   socket.on('send_message', async (payload) => {
