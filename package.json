@@ -10,6 +10,7 @@
     "@whiskeysockets/baileys": "*",
     "pino": "*",
     "express": "*",
-    "qrcode-terminal": "*"
+    "qrcode-terminal": "*",
+    "socket.io": "*"
   }
 }
