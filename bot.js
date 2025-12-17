@@ -884,8 +884,6 @@ io.on('connection', (socket) => {
     } catch (e) {}
   });
 
-  });
-
   socket.on('send_message', async (payload) => {
     try {
       const jid = payload?.jid;
