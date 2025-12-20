@@ -1,23 +1,98 @@
 const fs = require('fs');
 const path = require('path');
 
+const crypto = require('crypto');
+
+// =================== PASTAS (auth / data / backups) ===================
+const ROOT_DIR = __dirname;
+const AUTH_DIR = path.join(ROOT_DIR, 'auth');
+const DATA_DIR = path.join(ROOT_DIR, 'data');
+const BACKUP_DIR = path.join(ROOT_DIR, 'backups');
+
+function ensureDir(dir) {
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+}
+ensureDir(AUTH_DIR);
+ensureDir(DATA_DIR);
+ensureDir(BACKUP_DIR);
+
+
 // =================== MODOS DE TESTE ===================
-const DRY_RUN = String(process.env.DRY_RUN || '').toLowerCase() === '1' || String(process.env.DRY_RUN || '').toLowerCase() === 'true';
-const DISABLE_AUTOMATION = String(process.env.DISABLE_AUTOMATION || '').toLowerCase() === '1' || String(process.env.DISABLE_AUTOMATION || '').toLowerCase() === 'true';
-if (DRY_RUN) console.log('🧪 DRY_RUN ativo: NENHUMA mensagem será enviada (nem manual, nem automático).');
-if (DISABLE_AUTOMATION) console.log('🧪 DISABLE_AUTOMATION ativo: Seguimento/agenda/programados NÃO vão rodar (mas o painel e recebimento funcionam).');
+const DRY_RUN =
+  String(process.env.DRY_RUN || '').toLowerCase() === '1' ||
+  String(process.env.DRY_RUN || '').toLowerCase() === 'true';
+const DISABLE_AUTOMATION =
+  String(process.env.DISABLE_AUTOMATION || '').toLowerCase() === '1' ||
+  String(process.env.DISABLE_AUTOMATION || '').toLowerCase() === 'true';
 
-const P = require('pino');
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
+
+// =================== SEGURANÇA DO PAINEL ===================
+// Defina no Railway/PC: PANEL_PASSWORD=SuaSenhaForte
+const PANEL_PASSWORD = String(process.env.PANEL_PASSWORD || 'iron123');
+const PANEL_COOKIE_NAME = 'ig_panel';
+const PANEL_COOKIE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const panelSessions = new Map(); // token -> expiresAt
+
+function parseCookies(req) {
+  const header = String(req.headers.cookie || '');
+  const out = {};
+  header.split(';').forEach(part => {
+    const [k, ...rest] = part.trim().split('=');
+    if (!k) return;
+    out[k] = decodeURIComponent(rest.join('=') || '');
+  });
+  return out;
+}
+
+function newToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+function setCookie(res, name, val, opts = {}) {
+  const parts = [`${name}=${encodeURIComponent(val)}`];
+  if (opts.maxAgeMs) parts.push(`Max-Age=${Math.floor(opts.maxAgeMs / 1000)}`);
+  parts.push('Path=/');
+  parts.push('HttpOnly');
+  // SameSite Lax evita CSRF básico sem quebrar fetch same-origin
+  parts.push('SameSite=Lax');
+  // Em localhost não precisa Secure; em https é melhor
+  if (opts.secure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearCookie(res, name) {
+  res.setHeader('Set-Cookie', `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax`);
+}
+
+function requirePanelAuth(req, res, next) {
+  // libera login e assets
+  if (req.path === '/login' || req.path === '/logout') return next();
+
+  // API do painel também exige auth
+  const cookies = parseCookies(req);
+  const token = cookies[PANEL_COOKIE_NAME];
+  const exp = token ? panelSessions.get(token) : null;
+
+  if (token && exp && exp > Date.now()) return next();
+
+  // Se for API, retorna 401 JSON
+  if (req.path.startsWith('/api/')) {
+    return res.status(401).json({ error: 'Não autorizado' });
+  }
+
+  return res.redirect('/login');
+}
+
+
+// =================== IMPORTS WHATSAPP ===================
+
+const pino = require('pino');
 const qrcode = require('qrcode-terminal');
-
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
   DisconnectReason,
+  fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 
 // =================== CONFIG ===================
@@ -25,8 +100,9 @@ const {
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // Funil de vendas
-const STEPS_DAYS = [3, 5, 7, 15];      // 3d, 5d, 7d, 15d
-const EXTRA_INTERVAL_DAYS = 30;        // depois a cada 30 dias forever
+const FIRST_STEP_MS = 4 * 60 * 60 * 1000; // 1º follow-up: 4 horas
+const STEPS_DAYS = [3, 7, 15]; // depois: 3d, 7d, 15d
+const EXTRA_INTERVAL_DAYS = 30; // depois a cada 30 dias forever
 
 // Agenda confirmada (recordatórios)
 const AGENDA_OFFSETS_DAYS = [7, 3, 1]; // 7d / 3d / 1d antes
@@ -35,23 +111,24 @@ const AGENDA_OFFSETS_DAYS = [7, 3, 1]; // 7d / 3d / 1d antes
 const START_HOUR = 9;
 const END_HOUR = 22;
 
-// Comandos teus (discretos) — SOMENTE VOCÊ CONTROLA
+// Comandos teus
 const CMD_PAUSE = '#falamos no futuro';
 const CMD_STOP = '#okok';
 const CMD_CLIENT = '#cliente';
+const CMD_STATS = '#stats';
+const CMD_EXPORT = '#exportar';
 
-// Ignorar mensagens antigas (replay do Baileys)
+// Ignorar mensagens antigas
 const RECENT_WINDOW_MS = 10 * 60 * 1000; // 10 minutos
 
 // Arquivos de persistência
-const DATA_FILE = path.join(__dirname, 'clientes.json');
-const MSG_FILE = path.join(__dirname, 'mensajes.json');
-const BLOCK_FILE = path.join(__dirname, 'bloqueados.json');
-const PAUSE_FILE = path.join(__dirname, 'pausados.json');
-const AGENDA_FILE = path.join(__dirname, 'agendas.json');
-const PROGRAM_FILE = path.join(__dirname, 'programados.json');
-const CHAT_FILE = path.join(__dirname, 'chats.json');
-
+const DATA_FILE = path.join(DATA_DIR, 'clientes.json');
+const MSG_FILE = path.join(DATA_DIR, 'mensajes.json');
+const BLOCK_FILE = path.join(DATA_DIR, 'bloqueados.json');
+const PAUSE_FILE = path.join(DATA_DIR, 'pausados.json');
+const AGENDA_FILE = path.join(DATA_DIR, 'agendas.json');
+const PROGRAM_FILE = path.join(DATA_DIR, 'programados.json');
+const CHAT_FILE = path.join(DATA_DIR, 'chats.json');
 
 let clients = {};
 let messagesConfig = {};
@@ -66,118 +143,299 @@ let isConnected = false;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 
-let messageQueue = []; // itens: { jid, kind: 'funil'|'agenda'|'startFunil', key? }
-let botSentRecently = new Set(); // evita auto-trigger do bot
-let scheduledQueue = new Set();  // controla enfileiramento de mensagens programadas
+let messageQueue = []; // { jid, kind: 'funil'|'agenda'|'startFunil', key? }
+let botSentRecently = new Set();
+let scheduledQueue = new Set();
 
 // =================== LOAD/SAVE ===================
 
-function loadJSON(file, fallback = {}) {
-  if (!fs.existsSync(file)) return fallback;
+function listDataJSONFiles() {
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    ensureDir(DATA_DIR);
+    return fs.readdirSync(DATA_DIR)
+      .filter((f) => f.toLowerCase().endsWith('.json'))
+      .map((f) => path.join(DATA_DIR, f));
+  } catch (_) {
+    return [];
+  }
+}
+
+function runBackupNow() {
+  try {
+    ensureDir(BACKUP_DIR);
+    const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const outDir = path.join(BACKUP_DIR, day);
+    ensureDir(outDir);
+
+    const files = listDataJSONFiles();
+    for (const f of files) {
+      const base = path.basename(f);
+      const dest = path.join(outDir, base);
+      fs.copyFileSync(f, dest);
+    }
+    console.log('[BACKUP] OK ->', outDir, `(${files.length} arquivos)`);
   } catch (e) {
-    console.error(`Erro ao ler ${path.basename(file)}:`, e);
+    console.error('[BACKUP] Falhou:', e.message);
+  }
+}
+
+function scheduleDailyBackup(hour = 3, minute = 5) {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(hour, minute, 0, 0);
+  if (next.getTime() <= now.getTime()) next.setDate(next.getDate() + 1);
+  const ms = next.getTime() - now.getTime();
+
+  setTimeout(() => {
+    runBackupNow();
+    setInterval(runBackupNow, 24 * 60 * 60 * 1000);
+  }, ms);
+}
+
+
+
+
+function atomicWrite(file, content) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, content, 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+function loadJSON(file, fallback) {
+  try {
+    ensureDir(path.dirname(file));
+    if (!fs.existsSync(file)) {
+      atomicWrite(file, JSON.stringify(fallback, null, 2));
+      return fallback;
+    }
+    const raw = fs.readFileSync(file, 'utf8');
+    if (!raw.trim()) {
+      atomicWrite(file, JSON.stringify(fallback, null, 2));
+      return fallback;
+    }
+    return JSON.parse(raw);
+  } catch (e) {
+    try {
+      // Se corrompeu, salva uma cópia e reseta
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const corrupt = `${file}.corrupt.${ts}`;
+      try { fs.copyFileSync(file, corrupt); } catch (_) {}
+      atomicWrite(file, JSON.stringify(fallback, null, 2));
+    } catch (_) {}
+    console.error(`Erro ao ler ${path.basename(file)}:`, e.message);
     return fallback;
   }
 }
+
 function saveJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  try {
+    ensureDir(path.dirname(file));
+    atomicWrite(file, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error(`Erro ao salvar ${path.basename(file)}:`, e.message);
+  }
 }
+
+
+function defaultMessages() {
+  return {
+    step0:
+      'Olá! Tudo bem? Vi que você pediu informações sobre a proteção Iron Glass. Posso te ajudar em algo mais?',
+    step1:
+      'Passando pra lembrar da proteção Iron Glass que conversamos. Ainda tem interesse em proteger seu veículo?',
+    step2:
+      'Só pra não te deixar sem retorno: seguimos à disposição pra cuidar dos vidros do seu carro com Iron Glass.',
+    step3:
+      'Último lembrete: quando quiser falar sobre proteção de vidros, pode me chamar aqui 😊',
+    extra:
+      'Estamos sempre à disposição pra tirar dúvidas sobre a proteção Iron Glass.',
+    postSale30:
+      'Oi! Tudo bem com a proteção Iron Glass do seu carro? Se estiver gostando, você indicaria alguém que também queira proteger o veículo?',
+    agendaPrefix:
+      'Perfeito, sua agenda está confirmada conosco! Qualquer dúvida estou à disposição.',
+    agendaConfirmTemplate:
+      '📅 Confirmação de Agendamento - Iron Glass\n\nPrezado cliente,\nconfirmamos seu agendamento para o dia {{DATA}} às {{HORA}}h\n\n🚗 Veículo: {{VEICULO}}\n🛡️ Produto: {{PRODUTO}}\n💰 Valor total: {{VALOR}}\n💵 Sinal recebido: {{SINAL}} ({{PAGAMENTO}})\n📍 Endereço: {{ENDERECO}}\n\nAgradecemos a confiança em Iron Glass. Nossa equipe estará aguardando você na data marcada.',
+    agendaReminderTemplate:
+      '📌 Lembrete Iron Glass: faltam {{DIAS}} dia(s) para sua instalação.\n📅 {{DATA}} às {{HORA}}h\n🚗 {{VEICULO}} | 🛡️ {{PRODUTO}}\n📍 {{ENDERECO}}\nSe precisar remarcar, responda aqui.',
+    quickReplies: [
+      'Oi, tudo bem? 😊',
+      'Consigo te explicar rapidinho como funciona Iron Glass.',
+      'Podemos agendar sua instalação hoje mesmo.',
+    ],
+  };
+}
+
+function computeStats() {
+  const keys = new Set();
+  const addKeys = (obj) => {
+    if (!obj) return;
+    for (const k of Object.keys(obj)) keys.add(k);
+  };
+
+  addKeys(clients);
+  addKeys(blocked);
+  addKeys(paused);
+  addKeys(scheduledStarts);
+  addKeys(chatStore);
+
+  // agendas pode ser {jid: container}
+  addKeys(agendas);
+
+  const total = keys.size;
+
+  let blockedCount = 0;
+  let pausedCount = 0;
+  let agendaCount = 0;
+  let clientsCount = 0;
+  let activeCount = 0;
+
+  for (const jid of keys) {
+    if (blocked && blocked[jid]) blockedCount += 1;
+    if (paused && paused[jid]) pausedCount += 1;
+
+    const a = agendas && agendas[jid];
+    if (a && (a.appointmentTs || (a.reminders && a.reminders.length))) agendaCount += 1;
+
+    const c = clients && clients[jid];
+    if (c && c.isClient) clientsCount += 1;
+
+    if (!(blocked && blocked[jid])) activeCount += 1;
+  }
+
+  return {
+    total,
+    active: activeCount,
+    clients: clientsCount,
+    agendas: agendaCount,
+    paused: pausedCount,
+    blocked: blockedCount,
+  };
+}
+
+function toCSV(rows) {
+  const esc = (v) => {
+    const s = String(v ?? '');
+    if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  };
+  const header = ['numero', 'jid', 'etapa', 'estado', 'ultima_interacao', 'agenda'];
+  const lines = [header.join(',')];
+  for (const r of rows) {
+    lines.push([
+      esc(r.numero),
+      esc(r.jid),
+      esc(r.etapa),
+      esc(r.estado),
+      esc(r.ultima_interacao),
+      esc(r.agenda),
+    ].join(','));
+  }
+  return lines.join('\n');
+}
+
+function buildExportRows() {
+  const keys = new Set([
+    ...Object.keys(clients || {}),
+    ...Object.keys(chatStore || {}),
+    ...Object.keys(agendas || {}),
+    ...Object.keys(paused || {}),
+    ...Object.keys(blocked || {}),
+    ...Object.keys(scheduledStarts || {}),
+  ]);
+
+  const rows = [];
+  for (const jid of keys) {
+    const num = String(jid).split('@')[0] || jid;
+
+    const c = clients[jid] || {};
+    const st = blocked[jid] ? 'bloqueado' : paused[jid] ? 'pausado' : c.isClient ? 'cliente' : 'ativo';
+
+    const last = c.lastContact || (chatStore[jid] && chatStore[jid].lastMessageAt) || '';
+    const lastFmt = last ? new Date(last).toISOString() : '';
+
+    const agenda = agendas[jid] && agendas[jid].appointmentTs ? new Date(agendas[jid].appointmentTs).toISOString() : '';
+
+    rows.push({
+      numero: num,
+      jid,
+      etapa: typeof c.stepIndex === 'number' ? c.stepIndex : '',
+      estado: st,
+      ultima_interacao: lastFmt,
+      agenda,
+    });
+  }
+
+  // Ordena por última interação desc
+  rows.sort((a, b) => String(b.ultima_interacao).localeCompare(String(a.ultima_interacao)));
+  return rows;
+}
+
+async function sendCSVTo(jid) {
+  const rows = buildExportRows();
+  const csv = toCSV(rows);
+  const buf = Buffer.from(csv, 'utf8');
+  const fname = `clientes_${new Date().toISOString().slice(0,10)}.csv`;
+
+  if (!sock) throw new Error('Socket não inicializado');
+
+  if (DRY_RUN) {
+    console.log('[DRY_RUN] Enviaria CSV para', jid, '->', fname, 'bytes', buf.length);
+    return;
+  }
+
+  await sock.sendMessage(jid, {
+    document: buf,
+    fileName: fname,
+    mimetype: 'text/csv',
+    caption: `📄 Exportação de clientes (${rows.length})`,
+  });
+}
+
 
 function loadAll() {
   clients = loadJSON(DATA_FILE, {});
   messagesConfig = loadJSON(MSG_FILE, defaultMessages());
-  // garante respostas rápidas mesmo se o mensajes.json antigo não tiver esse campo
+
+// Backup diário automático (03:05)
+scheduleDailyBackup();
+
+
+  // Garantir estrutura mínima
   if (!Array.isArray(messagesConfig.quickReplies)) {
-    messagesConfig.quickReplies = (defaultMessages().quickReplies || []);
+    messagesConfig.quickReplies = defaultMessages().quickReplies;
     saveMessages();
   }
+
   blocked = loadJSON(BLOCK_FILE, {});
   paused = loadJSON(PAUSE_FILE, {});
   agendas = loadJSON(AGENDA_FILE, {});
   scheduledStarts = loadJSON(PROGRAM_FILE, {});
   chatStore = loadJSON(CHAT_FILE, {});
 }
-function saveClients() { saveJSON(DATA_FILE, clients); }
-function saveMessages() { saveJSON(MSG_FILE, messagesConfig); }
-function saveChats() { saveJSON(CHAT_FILE, chatStore); }
-function saveBlocked() { saveJSON(BLOCK_FILE, blocked); }
-function savePaused() { saveJSON(PAUSE_FILE, paused); }
-function saveAgendas() { saveJSON(AGENDA_FILE, agendas); }
-function saveProgramados() { saveJSON(PROGRAM_FILE, scheduledStarts); }
 
-// =================== DEFAULT MESSAGES ===================
-
-function defaultMessages() {
-  return {
-    step0:
-      'Olá! Tudo bem? Aqui é da Iron Glass 😊\n' +
-      'Passando só para dar continuidade ao seu atendimento. Se ainda tiver interesse, me chama aqui que eu te ajudo com tudo.',
-    step1:
-      'Oi! Aqui é da Iron Glass novamente 😉\n' +
-      'Queria saber se ainda tem interesse na proteção dos vidros do seu carro. Qualquer dúvida, pode falar comigo por aqui.',
-    step2:
-      'Tudo bem? Aqui é da Iron Glass 🛡️\n' +
-      'Não quero te incomodar, só lembrar que aquela condição especial ainda está disponível. Se fizer sentido para você, me chama.',
-    step3:
-      'Olá! Aqui é da Iron Glass 🚙\n' +
-      'Esse é o último lembrete dessa primeira sequência. Se ainda quiser proteger seu carro, será um prazer te atender.',
-
-    // Seguimento recorrente de interessados (leads) a cada 30 dias
-    extra:
-      'Olá! Tudo bem? Aqui é da Iron Glass 😊\n' +
-      'Só passando a cada 30 dias para saber se já é um bom momento para retomarmos a conversa sobre a proteção dos vidros do seu carro.',
-
-    // Pós-venda: clientes que já instalaram (30 dias após e depois a cada 30 dias)
-    postSale30:
-      'Olá! Aqui é da Iron Glass 🛡️\n' +
-      'Passando para saber se deu tudo certo com a sua proteção e se você conhece alguém que também queira proteger os vidros do carro.\n' +
-      'Sua indicação é muito importante para nós! 😊',
-
-    // Agenda (editáveis no painel)
-    agenda0:
-      '📅 Lembrete Iron Glass: falta 7 dias para seu agendamento.\n' +
-      'Qualquer dúvida antes do dia, estou por aqui. 😉',
-    agenda1:
-      '📅 Lembrete Iron Glass: faltam 3 dias para seu agendamento.\n' +
-      'Se precisar ajustar algo, me avise por aqui.',
-    agenda2:
-      '📅 Lembrete Iron Glass: é amanhã o seu agendamento.\n' +
-      'Te esperamos no horário combinado. 🚗🛡️',
-
-    // Template de confirmação (editável)
-    confirmTemplate:
-      '📅 Confirmação de Agendamento - Iron Glass\n\n' +
-      'Prezado cliente,\n' +
-      'confirmamos seu agendamento para o dia {{DATA}} às {{HORA}}.\n\n' +
-      '🚗 Veículo: {{VEICULO}}\n' +
-      '🛡️ Produto: {{PRODUTO}}\n' +
-      '💰 Valor total: {{VALOR}}\n' +
-      '💵 Sinal recebido: {{SINAL}} ({{PAGAMENTO}})\n\n' +
-      'Agradecemos a confiança em Iron Glass, líder em proteção automotiva premium.\n' +
-      'Nossa equipe estará aguardando na data marcada para realizar o serviço com toda a qualidade e garantia que nos caracterizam.',
-
-    // Respostas rápidas para o painel de conversas (editáveis)
-    quickReplies: [
-      { label: '✅ Enviar horários', text: 'Perfeito! Me diz: qual período você prefere (manhã/tarde)? Aí eu já te mando 2 horários disponíveis pra você escolher 😊' },
-      { label: '📍 Endereço / localização', text: 'Estamos na [ENDERECO]. Quer que eu te mande a localização no Google Maps?' },
-      { label: '🛡️ O que é Iron Glass', text: 'Iron Glass é uma proteção invisível para os vidros do carro (químico + térmico + polímero), com garantia de 10 anos. Ajuda a evitar riscos, manchas e microtrincas.' },
-      { label: '💳 Formas de pagamento', text: 'Temos Pix e cartão (em até 12x). Me diz qual você prefere que eu simule pra você?' },
-      { label: '🚗 Tempo de serviço', text: 'O serviço normalmente leva cerca de 3 a 4 horas. Você deixa o carro e retira no mesmo dia 🙂' },
-      { label: '📆 Agendar agora', text: 'Vamos agendar? Me diz seu modelo/ano e qual dia da semana você prefere que eu já te passo horários.' },
-      { label: '🧾 Enviar cotação', text: 'Claro! Me confirma: modelo/ano do carro e se você quer Iron Glass ou Iron Glass Plus, que eu já te mando a cotação certinha.' },
-      { label: '👍 Ok, entendido', text: 'Perfeito! Qualquer coisa estou por aqui 😊' }
-    ],
-  };
+function saveClients() {
+  saveJSON(DATA_FILE, clients);
+}
+function saveMessages() {
+  saveJSON(MSG_FILE, messagesConfig);
+}
+function saveBlocked() {
+  saveJSON(BLOCK_FILE, blocked);
+}
+function savePaused() {
+  saveJSON(PAUSE_FILE, paused);
+}
+function saveAgendas() {
+  saveJSON(AGENDA_FILE, agendas);
+}
+function saveProgramados() {
+  saveJSON(PROGRAM_FILE, scheduledStarts);
+}
+function saveChats() {
+  saveJSON(CHAT_FILE, chatStore);
 }
 
-// =================== HELPERS ===================
-
-function markBotSent(jid) {
-  botSentRecently.add(jid);
-  setTimeout(() => botSentRecently.delete(jid), 2 * 60 * 1000);
-}
+// =================== UTILS ===================
 
 function isInsideWindow(ts) {
   const d = new Date(ts);
@@ -185,17 +443,21 @@ function isInsideWindow(ts) {
   return h >= START_HOUR && h < END_HOUR;
 }
 
-// aplica variáveis em template
-function applyTemplate(tpl, data) {
-  let out = tpl || '';
-  for (const [k, v] of Object.entries(data || {})) {
-    out = out.replace(new RegExp(`{{${k}}}`, 'g'), v ?? '');
-  }
-  out = out.replace(/{{\w+}}/g, '').replace(/\n\n\n+/g, '\n\n').trim();
-  return out;
+function cleanText(t) {
+  if (!t) return '';
+  return t.replace(/\u200b/g, '').replace(/\s+/g, ' ').trim();
 }
 
-// timestamp da msg (Baileys vem em segundos)
+function getMsgBody(msg) {
+  const m = msg.message;
+  if (!m) return '';
+  if (m.conversation) return m.conversation;
+  if (m.extendedTextMessage) return m.extendedTextMessage.text || '';
+  if (m.imageMessage && m.imageMessage.caption) return m.imageMessage.caption;
+  if (m.videoMessage && m.videoMessage.caption) return m.videoMessage.caption;
+  return '';
+}
+
 function getMsgMs(msg) {
   if (msg.messageTimestamp) return Number(msg.messageTimestamp) * 1000;
   return Date.now();
@@ -211,163 +473,2383 @@ function parseAgendaConfirmation(text) {
     !lower.includes('confirmacion') &&
     !lower.includes('agendamento') &&
     !lower.includes('agenda')
-  ) return null;
+  )
+    return null;
 
-  // ✅ regex corrigida para Node 22
   const dateMatch = lower.match(/(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2,4})/);
   if (!dateMatch) return null;
 
-  let d = dateMatch[1], m = dateMatch[2], y = dateMatch[3];
+  let d = dateMatch[1],
+    m = dateMatch[2],
+    y = dateMatch[3];
   if (y.length === 2) y = '20' + y;
 
   const timeMatch = lower.match(/(\d{1,2})\s*[:h]\s*(\d{2})/i);
-  let hh = '09', mm = '00';
+  let hh = '09',
+    mm = '00';
   if (timeMatch) {
     hh = String(timeMatch[1]).padStart(2, '0');
     mm = String(timeMatch[2]).padStart(2, '0');
   }
 
-  const iso = `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}T${hh}:${mm}:00`;
+  const iso = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(
+    2,
+    '0'
+  )}T${hh}:${mm}:00`;
   const ts = new Date(iso).getTime();
   if (isNaN(ts)) return null;
   return ts;
 }
 
-// =================== FUNIL ===================
+// =================== CHAT STORE (PAINEL) ===================
 
-function startFollowUp(jid) {
-  if (blocked[jid]) return; // nunca reinicia pra bloqueado definitivo
-
-  const now = Date.now();
-  clients[jid] = {
-    lastContact: now,
-    stepIndex: 0,
-    nextFollowUpAt: now + STEPS_DAYS[0] * DAY_MS,
-    ignoreNextFromMe: false,
-  };
-  console.log('[FUNIL] Iniciado / reiniciado para', jid, '-> próximo em', STEPS_DAYS[0], 'dias');
-  saveClients();
+function ensureChat(jid) {
+  if (!chatStore[jid]) {
+    chatStore[jid] = {
+      jid,
+      messages: [],
+      unread: 0,
+      lastMessageAt: 0,
+      pinned: false,
+      name: jid,
+    };
+  }
+  return chatStore[jid];
 }
 
-function startPostSaleMonthly(jid) {
+function upsertChatMessage(jid, fromMe, text, timestamp) {
+  const chat = ensureChat(jid);
+  chat.messages.push({
+    fromMe,
+    text,
+    timestamp,
+  });
+  chat.lastMessageAt = timestamp || Date.now();
+  if (!fromMe) chat.unread += 1;
+  saveChats();
+  updateBeepLoop();
+  sseBroadcast({ type: 'message', jid, message: { fromMe, text, timestamp } });
+  sseBroadcast({ type: 'chat', jid, meta: { jid: chat.jid, name: chat.name, unread: chat.unread, lastMessageAt: chat.lastMessageAt, lastMessage: text, pinned: !!chat.pinned } });
+}
+
+
+// =================== TEMPLATE & AGENDA HELPERS ===================
+
+function renderTemplate(tpl, vars = {}) {
+  const safe = String(tpl ?? '');
+  return safe.replace(/\{\{\s*([A-Z0-9_]+)\s*\}\}/gi, (_, k) => {
+    const key = String(k || '').toUpperCase();
+    const val = vars[key];
+    return val === undefined || val === null ? '' : String(val);
+  });
+}
+
+function formatBRDate(ts) {
+  const d = new Date(ts);
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const yyyy = String(d.getFullYear());
+  return `${dd}/${mm}/${yyyy}`;
+}
+
+function formatBRTime(ts) {
+  const d = new Date(ts);
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${hh}:${mi}`;
+}
+
+function normalizeToJid(input) {
+  const digits = String(input || '').replace(/\D/g, '');
+  if (!digits) return null;
+  return digits + '@s.whatsapp.net';
+}
+
+// =================== ADMIN (para comandos #stats / #exportar) ===================
+// Opcional: ADMIN_NUMBERS="5511999999999,5511888888888"
+const ADMIN_NUMBERS = String(process.env.ADMIN_NUMBERS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const ADMIN_JIDS = new Set(ADMIN_NUMBERS.map(normalizeToJid).filter(Boolean));
+let MY_JID = null;
+
+function isAdminContext(jid) {
+  if (!jid) return false;
+  if (MY_JID && jid === MY_JID) return true; // mensagem para mim
+  if (ADMIN_JIDS.has(jid)) return true;
+  return false;
+}
+
+
+function getAgendaContainer(jid) {
+  const v = agendas[jid];
+  if (!v) return null;
+  if (Array.isArray(v)) return { reminders: v, details: {}, appointmentTs: null };
+  if (typeof v === 'object') {
+    return {
+      appointmentTs: v.appointmentTs || null,
+      details: v.details || {},
+      reminders: Array.isArray(v.reminders) ? v.reminders : [],
+    };
+  }
+  return null;
+}
+
+function setAgendaContainer(jid, container) {
+  agendas[jid] = container;
+  saveAgendas();
+}
+
+function getAgendaReminders(jid) {
+  const c = getAgendaContainer(jid);
+  return c ? c.reminders : [];
+}
+
+function hasActiveAgenda(jid) {
+  return getAgendaReminders(jid).length > 0;
+}
+
+// Replica a lógica do "fromMe" do WhatsApp, mas para mensagens enviadas pelo painel (/send)
+function processAgentMessage(jid, body, sentAt = Date.now()) {
+  if (!jid || !body) return;
+  const lower = String(body).toLowerCase();
+
+  // Comandos
+  if (lower.includes(CMD_STOP)) {
+    blockFollowUp(jid);
+    return;
+  }
+  if (lower.includes(CMD_PAUSE72)) {
+    pauseFollowUp(jid, 72);
+    return;
+  }
+  if (lower.includes(CMD_CLIENT)) {
+    markAsClient(jid);
+    return;
+  }
+
+  // Detecta confirmação de agenda no texto
+  const conf = parseAgendaConfirmation(body);
+  if (conf && conf.ts) {
+    scheduleAgenda(jid, conf.ts, { source: 'manual' });
+    console.log('[AGENDA] Confirmação detectada (painel) -> lembretes criados', jid);
+    return;
+  }
+
+  // Se não for comando, salva no chat store
+  if (body && body.trim() && !body.trim().startsWith('#')) {
+    upsertChatMessage(jid, true, body, sentAt);
+  }
+
+  // Regras para reiniciar funil
   if (blocked[jid]) return;
 
-  const now = Date.now();
-  const c = clients[jid] || {};
+  if (hasActiveAgenda(jid)) {
+    console.log('[PAINEL] Cliente com agenda ativa; não reinicia funil ->', jid);
+    return;
+  }
+  const c = clients[jid];
+  if (c && c.isClient) {
+    console.log('[PAINEL] Cliente pós-venda; não reinicia funil normal ->', jid);
+    return;
+  }
 
-  c.isClient = true; // marca como cliente pós-venda
-  c.stepIndex = STEPS_DAYS.length; // posição sentinela: sempre usará mensagem pós-venda
-  c.lastContact = now;
-  c.nextFollowUpAt = now + EXTRA_INTERVAL_DAYS * DAY_MS;
-  c.ignoreNextFromMe = false;
-
-  clients[jid] = c;
-  saveClients();
-
-  // se estiver em pausa, remove para não travar o fluxo mensal
   if (paused[jid]) {
+    const pausedAt = paused[jid].pauseUntil || 0;
+    if (sentAt < pausedAt) {
+      console.log('[PAINEL] Cliente pausado; não reinicia funil ->', jid);
+      return;
+    }
     delete paused[jid];
     savePaused();
   }
 
-  console.log('[PÓS-VENDA] Seguimento mensal ativado para', jid, '-> próxima em', EXTRA_INTERVAL_DAYS, 'dias');
-}
-
-function stopFollowUp(jid) {
-  if (clients[jid]) {
-    delete clients[jid];
-    saveClients();
+  // reinicia funil (4h)
+  if (!clients[jid]) {
+    clients[jid] = {
+      jid,
+      stepIndex: 0,
+      nextFollowUpAt: sentAt + FIRST_FOLLOWUP_HOURS * 60 * 60 * 1000,
+      ignoreNextFromMe: false,
+      isClient: false,
+      lastIncomingAt: 0,
+    };
+  } else {
+    clients[jid].stepIndex = 0;
+    clients[jid].nextFollowUpAt = sentAt + FIRST_FOLLOWUP_HOURS * 60 * 60 * 1000;
   }
+  saveClients();
+  console.log('[FUNIL] Reiniciado (painel) ->', jid);
 }
 
-function pauseFollowUp(jid) {
-  paused[jid] = { pausedAt: Date.now() };
-  savePaused();
 
-  // remove qualquer follow-up já enfileirado para esse contato
-  messageQueue = messageQueue.filter(item => !(item.jid === jid && item.kind === 'funil'));
-
-  stopFollowUp(jid);
-  console.log('[FUNIL] Pausado para', jid);
+function markChatRead(jid) {
+  const chat = ensureChat(jid);
+  chat.unread = 0;
+  saveChats();
+  updateBeepLoop();
+  sseBroadcast({ type: 'chat', jid, meta: { jid: chat.jid, name: chat.name, unread: chat.unread, lastMessageAt: chat.lastMessageAt, lastMessage: (chat.messages && chat.messages.length ? chat.messages[chat.messages.length-1].text : ''), pinned: !!chat.pinned } });
 }
 
-function blockFollowUp(jid, reason = 'STOP') {
-  // Marca como bloqueado DEFINITIVO: não entra mais em nenhum fluxo (funil, agenda, mensal, programados)
-  blocked[jid] = { blockedAt: Date.now(), reason };
-  saveBlocked();
-
-  // Pausa e remove funil
-  pauseFollowUp(jid);
-  stopFollowUp(jid);
-
-  // Cancela todos os lembretes de agenda
-  cancelAgenda(jid);
-
-  // Cancela qualquer mensagem inicial programada
-  if (scheduledStarts[jid]) {
-    delete scheduledStarts[jid];
-    saveProgramados();
-    scheduledQueue.delete(jid);
-  }
-
-  // Limpa qualquer item já enfileirado na fila
-  messageQueue = messageQueue.filter(m => m.jid !== jid);
-
-  console.log('[FUNIL] Bloqueado definitivo para', jid);
+function hasUnread() {
+  return Object.values(chatStore).some((c) => c.unread > 0);
 }
 
-// =================== AGENDA ===================
+// =================== EXPRESS / HTTP ===================
 
-function scheduleAgenda(jid, appointmentTs, meta) {
-  const now = Date.now();
-  const list = [];
-  const payload = meta || {};
+const express = require('express');
+const http = require('http');
+const app = express();
+const server = http.createServer(app);
 
-  // Sempre que agenda é criada, paramos o funil normal e limpamos fila/programados
-  stopFollowUp(jid);
+const sseClients = new Set();
 
-  // remove qualquer follow-up já enfileirado para esse contato
-  messageQueue = messageQueue.filter(item => !(item.jid === jid && item.kind === 'funil'));
+function sseWrite(res, data) {
+  try {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch (e) {}
+}
 
-  // se havia mensagem inicial programada, é descartada ao entrar em agenda
-  if (scheduledStarts[jid]) {
-    delete scheduledStarts[jid];
-    saveProgramados();
-    scheduledQueue.delete(jid);
-  }
-
-  AGENDA_OFFSETS_DAYS.forEach((days, idx) => {
-    const at = appointmentTs - days * DAY_MS;
-    if (at > now) {
-      list.push({
-        at,
-        key: `agenda${idx}`,
-        data: payload, // dados da confirmação (DATA, HORA, VEICULO, etc.)
-      });
+function sseBroadcast(data) {
+  for (const res of Array.from(sseClients)) {
+    try {
+      sseWrite(res, data);
+    } catch (e) {
+      sseClients.delete(res);
     }
+  }
+}
+
+app.get('/sse', (req, res) => {
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (res.flushHeaders) res.flushHeaders();
+
+  sseClients.add(res);
+  sseWrite(res, { type: 'hello', ts: Date.now() });
+
+  const ping = setInterval(() => {
+    try { res.write('event: ping\ndata: {}\n\n'); } catch (e) {}
+  }, 20000);
+
+  req.on('close', () => {
+    clearInterval(ping);
+    sseClients.delete(res);
+  });
+});
+
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(requirePanelAuth);
+
+
+app.get('/', (req, res) => {
+  res.redirect('/admin');
+});
+
+
+app.get('/login', (req, res) => {
+  const html = `
+  <!doctype html>
+  <html lang="pt-br">
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>Iron Glass • Login</title>
+    <style>
+      *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+      body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(1200px 800px at 20% 20%, #0b1223 0%, #020617 55%, #000 100%);color:#e2e8f0}
+      .card{width:min(420px,92vw);background:rgba(15,23,42,.7);border:1px solid rgba(148,163,184,.18);border-radius:18px;box-shadow:0 20px 60px rgba(0,0,0,.55);padding:22px}
+      h1{font-size:18px;margin:0 0 8px 0;letter-spacing:.4px}
+      p{margin:0 0 16px 0;color:#94a3b8;font-size:13px}
+      input{width:100%;padding:12px 14px;border-radius:12px;border:1px solid rgba(148,163,184,.25);background:rgba(2,6,23,.55);color:#e2e8f0;outline:none}
+      button{width:100%;margin-top:12px;padding:12px 14px;border-radius:12px;border:0;background:linear-gradient(90deg,#2563eb,#60a5fa);color:#fff;font-weight:700;cursor:pointer}
+      .err{margin-top:10px;color:#fca5a5;font-size:13px;display:none}
+      .brand{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+      .badge{width:38px;height:38px;border-radius:14px;background:linear-gradient(135deg,#0ea5e9,#1d4ed8);display:flex;align-items:center;justify-content:center;font-weight:900}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="brand"><div class="badge">IG</div><div><h1>Painel Iron Glass</h1><p>Digite sua senha para acessar.</p></div></div>
+      <form method="POST" action="/login">
+        <input type="password" name="password" placeholder="Senha do painel" autofocus />
+        <button type="submit">Entrar</button>
+      </form>
+      <div class="err" id="err">Senha incorreta.</div>
+      <script>
+        const u = new URL(location.href);
+        if (u.searchParams.get('err') === '1') document.getElementById('err').style.display = 'block';
+      </script>
+    </div>
+  </body>
+  </html>`;
+  res.send(html);
+});
+
+app.post('/login', (req, res) => {
+  const pass = String((req.body && req.body.password) || '');
+  if (pass !== PANEL_PASSWORD) return res.redirect('/login?err=1');
+
+  const token = newToken();
+  panelSessions.set(token, Date.now() + PANEL_COOKIE_TTL_MS);
+  setCookie(res, PANEL_COOKIE_NAME, token, { maxAgeMs: PANEL_COOKIE_TTL_MS });
+
+  return res.redirect('/admin?tab=chat');
+});
+
+app.post('/logout', (req, res) => {
+  const cookies = parseCookies(req);
+  const token = cookies[PANEL_COOKIE_NAME];
+  if (token) panelSessions.delete(token);
+  clearCookie(res, PANEL_COOKIE_NAME);
+  res.redirect('/login');
+});
+
+app.get('/admin', (req, res) => {
+  const tab = req.query.tab || 'chat';
+
+  if (tab === 'config') {
+    return renderConfigPage(req, res);
+  }
+  if (tab === 'program') {
+    return renderProgramPage(req, res);
+  }
+  if (tab === 'calendar') {
+    return renderCalendarPage(req, res);
+  }
+
+  return renderChatPage(req, res);
+});
+
+function renderChatPage(req, res) {
+  // Ordena: pinned primeiro, depois por última mensagem
+  const chats = Object.values(chatStore || {}).sort((a, b) => {
+    const ap = a && a.pinned ? 1 : 0;
+    const bp = b && b.pinned ? 1 : 0;
+    if (ap !== bp) return bp - ap;
+    const at = Number(a && a.lastMessageAt ? a.lastMessageAt : 0);
+    const bt = Number(b && b.lastMessageAt ? b.lastMessageAt : 0);
+    return bt - at;
   });
 
-  if (list.length === 0) {
-    console.log('[AGENDA] Nenhum lembrete futuro para programar ->', jid);
-    return;
+  const esc = (s) =>
+    String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+
+  const quickArray = Array.isArray(messagesConfig?.quickReplies)
+    ? messagesConfig.quickReplies
+    : defaultMessages().quickReplies;
+
+  const quickRepliesHtml = quickArray
+    .map((qRaw) => {
+      const q = String(qRaw ?? '');
+      const safeLabel = esc(q);
+      const safeJs = q.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      return `
+      <button class="quick-reply" onclick="appendQuickReply('${safeJs}')">
+        ${safeLabel}
+      </button>
+    `;
+    })
+    .join('');
+
+  const chatItemsHtml = chats
+    .map((c) => {
+      const msgs = Array.isArray(c.messages) ? c.messages : [];
+      const lastMsg = msgs.length ? (msgs[msgs.length - 1].text || '') : '';
+      const lastTime = c.lastMessageAt
+        ? new Date(c.lastMessageAt).toLocaleTimeString('pt-BR', {
+            hour: '2-digit',
+            minute: '2-digit',
+          })
+        : '--:--';
+      const initials = (c.name || c.jid || '')
+        .split('@')[0]
+        .replace(/\D/g, '')
+        .slice(-4);
+
+      const pinIcon = c.pinned ? '📌' : '📍';
+
+      return `
+      <div class="chat-item" data-jid="${esc(c.jid)}" onclick="selectChat('${esc(c.jid)}')">
+        <div class="avatar">${esc(initials || 'IG')}</div>
+        <div class="info">
+          <div class="top-row">
+            <div class="name">${esc(c.name || c.jid)}</div>
+            <div class="time">${esc(lastTime)}</div>
+          </div>
+          <div class="last-message">${esc(lastMsg)}</div>
+        </div>
+        <button class="pin-btn" title="Anclar" onclick="togglePin(event, '${esc(c.jid)}')">${pinIcon}</button>
+        ${c.unread ? `<div class="unread">${Number(c.unread || 0)}</div>` : ''}
+      </div>
+    `;
+    })
+    .join('');
+
+  const html = `
+  <!DOCTYPE html>
+  <html lang="pt-br">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Iron Glass - Painel</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top left, #111827, #020617, #000);
+        color: #e5e7eb;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        padding: 12px 20px;
+        border-bottom: 1px solid rgba(148,163,184,0.2);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        backdrop-filter: blur(12px);
+        background: linear-gradient(to right, rgba(15,23,42,0.95), rgba(30,64,175,0.6));
+        box-shadow: 0 15px 45px rgba(15,23,42,0.8);
+        position: relative;
+        z-index: 10;
+      }
+      header .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      header .logo-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 12px;
+        background: radial-gradient(circle at 30% 20%, #facc15, #f97316 40%, #0f172a 75%, #020617 100%);
+        box-shadow:
+          0 0 20px rgba(250,204,21,0.7),
+          0 0 50px rgba(37,99,235,0.6),
+          inset 0 0 15px rgba(15,23,42,0.9);
+        position: relative;
+        overflow: hidden;
+      }
+      header .logo-icon::before {
+        content: "";
+        position: absolute;
+        inset: 3px;
+        border-radius: 10px;
+        border: 1px solid rgba(248,250,252,0.1);
+        box-shadow:
+          0 0 10px rgba(59,130,246,0.4),
+          inset 0 0 10px rgba(15,23,42,0.9);
+      }
+      header .logo-text {
+        display: flex;
+        flex-direction: column;
+      }
+      header .logo-text span:first-child {
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        font-size: 13px;
+        text-transform: uppercase;
+        color: #e5e7eb;
+      }
+      header .logo-text span:last-child {
+        font-size: 11px;
+        color: #9ca3af;
+      }
+      header .status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #9ca3af;
+        justify-content: flex-end;
+      }
+      header .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: ${isConnected ? '#22c55e' : '#ef4444'};
+        box-shadow: 0 0 10px rgba(34,197,94,0.8);
+      }
+      header .pill {
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(15,23,42,0.7);
+        border: 1px solid rgba(148,163,184,0.5);
+        color: #e5e7eb;
+        font-size: 11px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+      header .pill span {
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: rgba(37,99,235,0.25);
+        border: 1px solid rgba(59,130,246,0.5);
+        font-size: 10px;
+        text-transform: uppercase;
+      }
+
+      .tabs {
+        margin-top: 8px;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .tab {
+        font-size: 11px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(148,163,184,0.5);
+        color: #e5e7eb;
+        text-decoration: none;
+        background: rgba(15,23,42,0.6);
+      }
+      .tab.active {
+        background: rgba(37,99,235,0.7);
+        border-color: rgba(129,140,248,0.9);
+      }
+
+      main { flex: 1; display: flex; overflow: hidden; }
+
+      .sidebar {
+        width: 320px;
+        max-width: 340px;
+        border-right: 1px solid rgba(148,163,184,0.2);
+        background: linear-gradient(to bottom, rgba(15,23,42,0.85), rgba(15,23,42,0.95));
+        display: flex;
+        flex-direction: column;
+      }
+
+      .sidebar-header {
+        padding: 10px 14px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        border-bottom: 1px solid rgba(148,163,184,0.2);
+      }
+      .sidebar-header input {
+        flex: 1;
+        background: rgba(15,23,42,0.9);
+        border-radius: 999px;
+        border: 1px solid rgba(55,65,81,0.9);
+        padding: 6px 10px;
+        font-size: 12px;
+        color: #e5e7eb;
+        outline: none;
+      }
+      .sidebar-header input::placeholder { color: #6b7280; }
+      .sidebar-header button {
+        border-radius: 999px;
+        border: 1px solid rgba(55,65,81,0.9);
+        background: radial-gradient(circle at top left, rgba(59,130,246,0.3), rgba(15,23,42,0.95));
+        color: #e5e7eb;
+        font-size: 11px;
+        padding: 6px 10px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .sidebar-header button:hover {
+        background: radial-gradient(circle at top left, rgba(59,130,246,0.5), rgba(15,23,42,0.95));
+      }
+
+      .chat-list { flex: 1; overflow-y: auto; padding: 8px 6px; }
+
+      .chat-item {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 10px;
+        margin-bottom: 4px;
+        border-radius: 12px;
+        cursor: pointer;
+        transition: background 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+        border: 1px solid transparent;
+      }
+      .chat-item:hover {
+        background: radial-gradient(circle at top left, rgba(30,64,175,0.35), rgba(15,23,42,1));
+        box-shadow: 0 8px 25px rgba(15,23,42,0.8);
+        transform: translateY(-1px);
+        border-color: rgba(59,130,246,0.5);
+      }
+      .chat-item.active {
+        background: radial-gradient(circle at top left, rgba(37,99,235,0.4), rgba(15,23,42,1));
+        border-color: rgba(129,140,248,0.8);
+        box-shadow:
+          0 0 0 1px rgba(129,140,248,0.5),
+          0 10px 35px rgba(30,64,175,0.9);
+      }
+      .chat-item .avatar {
+        width: 32px;
+        height: 32px;
+        border-radius: 10px;
+        background: radial-gradient(circle at top left, #1d4ed8, #0f172a);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 13px;
+        font-weight: 600;
+        color: #e5e7eb;
+        box-shadow:
+          0 0 12px rgba(37,99,235,0.7),
+          inset 0 0 8px rgba(15,23,42,0.9);
+        flex-shrink: 0;
+      }
+      .chat-item .info { flex: 1; min-width: 0; }
+      .chat-item .info .top-row { display: flex; justify-content: space-between; margin-bottom: 2px; gap: 6px; }
+      .chat-item .info .name { font-size: 13px; font-weight: 600; color: #e5e7eb; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .chat-item .info .time { font-size: 11px; color: #9ca3af; flex-shrink: 0; }
+      .chat-item .info .last-message { font-size: 11px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 175px; }
+
+      .pin-btn{
+        width: 30px;
+        height: 30px;
+        border-radius: 10px;
+        border: 1px solid rgba(55,65,81,0.9);
+        background: rgba(15,23,42,0.9);
+        color: #e5e7eb;
+        cursor: pointer;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        flex-shrink: 0;
+      }
+      .pin-btn:hover{ border-color: rgba(59,130,246,0.8); }
+
+      .chat-item .unread {
+        min-width: 18px;
+        height: 18px;
+        border-radius: 999px;
+        background: radial-gradient(circle at top left, #f97316, #b91c1c);
+        color: white;
+        font-size: 11px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow:
+          0 0 10px rgba(248,113,113,0.8),
+          0 0 25px rgba(248,250,252,0.4);
+        flex-shrink: 0;
+      }
+
+      .chat-area {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        background: radial-gradient(circle at top left, #020617, #020617, #030712);
+      }
+      .chat-header {
+        padding: 10px 16px;
+        border-bottom: 1px solid rgba(148,163,184,0.2);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        background: linear-gradient(to right, rgba(15,23,42,0.9), rgba(30,64,175,0.4));
+      }
+      .chat-header .title { display: flex; flex-direction: column; }
+      .chat-header .title span:first-child { font-size: 14px; font-weight: 600; color: #e5e7eb; }
+      .chat-header .title span:last-child { font-size: 11px; color: #9ca3af; }
+      .chat-header .tags { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+      .chat-header .tag { font-size: 10px; padding: 3px 8px; border-radius: 999px; border: 1px solid rgba(148,163,184,0.6); color: #e5e7eb; background: rgba(15,23,42,0.8); }
+
+      .messages { flex: 1; padding: 12px 16px; overflow-y: auto; }
+      .msg {
+        max-width: 70%;
+        margin-bottom: 8px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        font-size: 13px;
+        line-height: 1.35;
+        word-wrap: break-word;
+        overflow-wrap: break-word;
+        white-space: pre-wrap;
+      }
+      .msg.me {
+        margin-left: auto;
+        background: linear-gradient(to bottom right, #1d4ed8, #4f46e5);
+        color: white;
+        border-bottom-right-radius: 4px;
+      }
+      .msg.them {
+        margin-right: auto;
+        background: rgba(15,23,42,0.9);
+        border: 1px solid rgba(55,65,81,0.9);
+        color: #e5e7eb;
+        border-bottom-left-radius: 4px;
+      }
+      .msg .time {
+        margin-top: 4px;
+        font-size: 10px;
+        color: #9ca3af;
+        text-align: right;
+      }
+
+      .input-area {
+        padding: 10px 14px;
+        border-top: 1px solid rgba(148,163,184,0.2);
+        background: linear-gradient(to bottom, rgba(15,23,42,0.96), rgba(15,23,42,1));
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .input-row { display: flex; gap: 8px; align-items: flex-end; }
+      .input-row textarea {
+        flex: 1;
+        resize: none;
+        min-height: 42px;
+        max-height: 120px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        border: 1px solid rgba(55,65,81,0.9);
+        background: rgba(15,23,42,0.9);
+        color: #e5e7eb;
+        font-size: 13px;
+        outline: none;
+      }
+      .input-row textarea::placeholder { color: #6b7280; }
+      .input-row button {
+        padding: 8px 14px;
+        border-radius: 12px;
+        border: none;
+        background: linear-gradient(to right, #22c55e, #16a34a);
+        color: white;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 10px 30px rgba(22,163,74,0.8);
+      }
+      .input-row button:hover { background: linear-gradient(to right, #16a34a, #15803d); }
+
+      .quick-replies { display: flex; flex-wrap: wrap; gap: 6px; }
+      .quick-reply {
+        font-size: 11px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(55,65,81,0.9);
+        background: rgba(15,23,42,0.9);
+        color: #e5e7eb;
+        cursor: pointer;
+      }
+      .quick-reply:hover { border-color: rgba(59,130,246,0.8); }
+
+      .messages::-webkit-scrollbar,
+      .chat-list::-webkit-scrollbar { width: 6px; }
+      .messages::-webkit-scrollbar-thumb,
+      .chat-list::-webkit-scrollbar-thumb { background: rgba(75,85,99,0.8); border-radius: 999px; }
+      .messages::-webkit-scrollbar-track,
+      .chat-list::-webkit-scrollbar-track { background: transparent; }
+
+      @media (max-width: 900px) {
+        .sidebar { width: 260px; }
+        .chat-item .info .last-message { max-width: 140px; }
+      }
+      @media (max-width: 700px) {
+        main { flex-direction: column; }
+        .sidebar { width: 100%; max-width: 100%; height: 40vh; }
+        .chat-area { height: 60vh; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="logo">
+        <div class="logo-icon"></div>
+        <div class="logo-text">
+          <span>IRON GLASS</span>
+          <span>Central de Conversas</span>
+        </div>
+      </div>
+      <div>
+        <div class="status">
+          <div class="status-dot"></div>
+          <span>${isConnected ? 'WhatsApp conectado' : 'WhatsApp desconectado'}</span>
+          <div class="pill">Seg. Inteligente <span>Follow-up</span></div>
+        </div>
+        <div class="tabs">
+          <a href="/admin?tab=chat" class="tab active">Conversas</a>
+          <a href="/admin?tab=config" class="tab">Configuração</a>
+          <a href="/admin?tab=program" class="tab">Programados</a>
+          <a href="/admin?tab=calendar" class="tab">Calendário</a>
+        </div>
+      </div>
+    </header>
+    <main>
+      <section class="sidebar">
+        <div class="sidebar-header">
+          <input id="search" placeholder="Buscar contato..." oninput="filterChats()" />
+          <button onclick="refreshChats()">Atualizar</button>
+          <button id="btn-sound" onclick="enableSound()">Som 🔊</button>
+        </div>
+        <div class="chat-list" id="chat-list">
+          ${chatItemsHtml}
+        </div>
+      </section>
+      <section class="chat-area">
+        <div class="chat-header">
+          <div class="title">
+            <span id="chat-title">Selecione um contato</span>
+            <span id="chat-subtitle">Histórico completo da conversa</span>
+          </div>
+          <div class="tags">
+            <div class="tag">Follow-up 4h / 3 / 7 / 15</div>
+            <div class="tag">Agenda & Pós-venda</div>
+          </div>
+        </div>
+        <div class="messages" id="messages"></div>
+        <div class="input-area">
+          <div class="quick-replies" id="quick-replies">
+            ${quickRepliesHtml}
+          </div>
+          <div class="input-row">
+            <textarea id="msg-input" placeholder="Digite uma mensagem para enviar pelo seu WhatsApp..."></textarea>
+            <button onclick="sendFromPanel()">Enviar</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      let currentJid = null;
+      let lastTotal = 0;
+
+      // ================== SOM FORTE (WebAudio) ==================
+      let audioEnabled = false;
+      let audioCtx = null;
+      let beepTimer = null;
+
+      function enableSound() {
+        try {
+          audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+          audioEnabled = true;
+          localStorage.setItem('ig_audio', '1');
+          document.getElementById('btn-sound').textContent = 'Som ✅';
+          playBeepOnce();
+        } catch (e) {
+          alert('Seu navegador bloqueou o som. Clique novamente.');
+        }
+      }
+
+      function playBeepOnce() {
+        if (!audioEnabled) return;
+        if (!audioCtx) return;
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = 'square';
+        o.frequency.value = 880; // mais forte
+        g.gain.value = 0.12;
+        o.connect(g);
+        g.connect(audioCtx.destination);
+        o.start();
+        setTimeout(() => { try { o.stop(); } catch(e) {} }, 180);
+      }
+
+      function startBeepLoop() {
+        if (!audioEnabled) return;
+        if (beepTimer) return;
+        beepTimer = setInterval(() => {
+          if (!hasUnreadFlag()) {
+            stopBeepLoop();
+            return;
+          }
+          playBeepOnce();
+        }, 1200);
+      }
+      function stopBeepLoop() {
+        if (beepTimer) clearInterval(beepTimer);
+        beepTimer = null;
+      }
+
+      // ================== UTILS ==================
+      function fmtTime(ts) {
+        try {
+          const d = new Date(ts);
+          return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+        } catch (e) { return '--:--'; }
+      }
+
+      function isAtBottom(el) {
+        const slack = 30;
+        return (el.scrollTop + el.clientHeight + slack) >= el.scrollHeight;
+      }
+
+      // ================== PIN ==================
+      async function togglePin(ev, jid) {
+        ev.preventDefault();
+        ev.stopPropagation();
+
+        const el = document.querySelector('.chat-item[data-jid="' + CSS.escape(jid) + '"]');
+        const btn = el ? el.querySelector('.pin-btn') : null;
+        const isPinned = btn && btn.textContent.includes('📌');
+        const next = !isPinned;
+
+        try {
+          await fetch('/api/chat/pin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jid, pinned: next })
+          });
+          // Recarrega para reordenar (pinned primeiro) – não apaga histórico, só reordena.
+          window.location.reload();
+        } catch (e) {
+          alert('Falha ao anclar: ' + (e.message || e));
+        }
+      }
+
+      // ================== CHAT SELECT ==================
+      async function selectChat(jid) {
+        currentJid = jid;
+
+        document.querySelectorAll('.chat-item').forEach(el => {
+          el.classList.toggle('active', el.dataset.jid === jid);
+        });
+
+        try {
+          const r = await fetch('/chats/' + encodeURIComponent(jid) + '?limit=400', { cache: 'no-store' });
+          const data = await r.json();
+
+          const title = document.getElementById('chat-title');
+          const messagesDiv = document.getElementById('messages');
+
+          title.textContent = data.name || jid;
+          const stayBottom = isAtBottom(messagesDiv);
+
+          messagesDiv.innerHTML = '';
+          (data.messages || []).forEach(m => {
+            const div = document.createElement('div');
+            div.className = 'msg ' + (m.fromMe ? 'me' : 'them');
+            div.textContent = m.text || '';
+            const timeSpan = document.createElement('div');
+            timeSpan.className = 'time';
+            timeSpan.textContent = fmtTime(m.timestamp);
+            div.appendChild(timeSpan);
+            messagesDiv.appendChild(div);
+          });
+
+          lastTotal = Number(data.totalMessages || (data.messages ? data.messages.length : 0));
+
+          if (stayBottom) {
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+          }
+
+          fetch('/chats/' + encodeURIComponent(jid) + '/read', { method: 'POST' }).catch(()=>{});
+          syncUnreadAndBeep();
+        } catch (e) {
+          alert('Erro ao abrir conversa: ' + (e.message || e));
+        }
+      }
+
+      function refreshChats() {
+        window.location.reload();
+      }
+
+      function appendQuickReply(text) {
+        const input = document.getElementById('msg-input');
+        if (!input.value) input.value = text;
+        else input.value += '\\n' + text;
+        input.focus();
+      }
+
+      async function sendFromPanel() {
+        const input = document.getElementById('msg-input');
+        const text = (input.value || '').trim();
+        if (!currentJid || !text) return;
+
+        try {
+          await fetch('/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jid: currentJid, text })
+          });
+
+          input.value = '';
+          // Recarrega só o chat atual (leve)
+          await selectChat(currentJid);
+        } catch (e) {
+          alert('Falha ao enviar: ' + (e.message || e));
+        }
+      }
+
+      function hasUnreadFlag() {
+        const items = document.querySelectorAll('.chat-item .unread');
+        return items.length > 0;
+      }
+
+      function syncUnreadAndBeep() {
+        if (hasUnreadFlag()) startBeepLoop();
+        else stopBeepLoop();
+      }
+
+      // ================== LIVE (SEM TRAVAR) ==================
+      let pollMetaRunning = false;
+      let pollChatRunning = false;
+
+      async function pollMeta() {
+        if (pollMetaRunning) return;
+        pollMetaRunning = true;
+        try {
+          const r = await fetch('/api/chats', { cache: 'no-store' });
+          const data = await r.json();
+          const chats = (data && data.chats) ? data.chats : [];
+          // Só atualiza badges e preview; não re-renderiza a lista toda.
+          for (const c of chats) {
+            const row = document.querySelector('.chat-item[data-jid="' + CSS.escape(c.jid) + '"]');
+            if (!row) continue;
+
+            // unread
+            const oldUnread = row.querySelector('.unread');
+            const newUnread = Number(c.unread || 0);
+
+            if (newUnread > 0) {
+              if (oldUnread) oldUnread.textContent = String(newUnread);
+              else {
+                const d = document.createElement('div');
+                d.className = 'unread';
+                d.textContent = String(newUnread);
+                row.appendChild(d);
+              }
+            } else {
+              if (oldUnread) oldUnread.remove();
+            }
+
+            // last msg + time
+            const lastMsgEl = row.querySelector('.last-message');
+            if (lastMsgEl && typeof c.lastMessage === 'string') {
+              const t = c.lastMessage;
+              if (lastMsgEl.textContent !== t) lastMsgEl.textContent = t;
+            }
+            const timeEl = row.querySelector('.time');
+            if (timeEl && c.lastMessageAt) {
+              const t2 = new Date(c.lastMessageAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+              if (timeEl.textContent !== t2) timeEl.textContent = t2;
+            }
+
+            // pin icon (não muda sozinho, mas mantém certo)
+            const pinBtn = row.querySelector('.pin-btn');
+            if (pinBtn) pinBtn.textContent = c.pinned ? '📌' : '📍';
+          }
+
+          syncUnreadAndBeep();
+        } catch (e) {
+          // não trava
+        } finally {
+          pollMetaRunning = false;
+        }
+      }
+
+      async function pollCurrentChat() {
+        if (!currentJid) return;
+        if (pollChatRunning) return;
+        pollChatRunning = true;
+        try {
+          const r = await fetch('/chats/' + encodeURIComponent(currentJid) + '?limit=400', { cache: 'no-store' });
+          const data = await r.json();
+          const total = Number(data.totalMessages || 0);
+          if (total !== lastTotal) {
+            // atualiza a conversa sem piscar demais
+            const messagesDiv = document.getElementById('messages');
+            const stayBottom = isAtBottom(messagesDiv);
+
+            messagesDiv.innerHTML = '';
+            (data.messages || []).forEach(m => {
+              const div = document.createElement('div');
+              div.className = 'msg ' + (m.fromMe ? 'me' : 'them');
+              div.textContent = m.text || '';
+              const timeSpan = document.createElement('div');
+              timeSpan.className = 'time';
+              timeSpan.textContent = fmtTime(m.timestamp);
+              div.appendChild(timeSpan);
+              messagesDiv.appendChild(div);
+            });
+
+            lastTotal = total;
+            if (stayBottom) messagesDiv.scrollTop = messagesDiv.scrollHeight;
+          }
+        } catch (e) {
+          // ignora
+        } finally {
+          pollChatRunning = false;
+        }
+      }
+
+      function filterChats() {
+        const q = (document.getElementById('search').value || '').toLowerCase().trim();
+        document.querySelectorAll('.chat-item').forEach(row => {
+          const name = (row.querySelector('.name')?.textContent || '').toLowerCase();
+          const jid = (row.dataset.jid || '').toLowerCase();
+          const show = !q || name.includes(q) || jid.includes(q);
+          row.style.display = show ? '' : 'none';
+        });
+      }
+
+      // Auto enable som se já liberado antes
+      (function initSoundPref(){
+        try {
+          if (localStorage.getItem('ig_audio') === '1') {
+            // não chama play até o usuário interagir (alguns navegadores), mas deixa marcado
+            document.getElementById('btn-sound').textContent = 'Som 🔊';
+          }
+        } catch(e) {}
+      })();
+
+      // Poll leve (não congela): meta a cada 4s, chat aberto a cada 2s
+      setInterval(pollMeta, 4000);
+      setInterval(pollCurrentChat, 2000);
+      pollMeta();
+      syncUnreadAndBeep();
+    </script>
+  </body>
+  </html>
+  `;
+
+  res.send(html);
+}
+
+
+function renderConfigPage(req, res) {
+  const msg = messagesConfig;
+  const quickList = Array.isArray(msg.quickReplies)
+    ? msg.quickReplies
+    : defaultMessages().quickReplies;
+  const quickRepliesText = quickList
+    .map((s) => String(s ?? ''))
+    .join('\n');
+
+  const html = `
+  <!DOCTYPE html>
+  <html lang="pt-br">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Iron Glass - Configuração</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top left, #111827, #020617, #000);
+        color: #e5e7eb;
+        margin: 0;
+        padding: 0;
+      }
+      header {
+        padding: 12px 20px;
+        border-bottom: 1px solid rgba(148,163,184,0.2);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        backdrop-filter: blur(12px);
+        background: linear-gradient(to right, rgba(15,23,42,0.95), rgba(30,64,175,0.6));
+        box-shadow: 0 15px 45px rgba(15,23,42,0.8);
+      }
+      header .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      header .logo-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 12px;
+        background: radial-gradient(circle at 30% 20%, #facc15, #f97316 40%, #0f172a 75%, #020617 100%);
+        box-shadow:
+          0 0 20px rgba(250,204,21,0.7),
+          0 0 50px rgba(37,99,235,0.6),
+          inset 0 0 15px rgba(15,23,42,0.9);
+        position: relative;
+        overflow: hidden;
+      }
+      header .logo-text {
+        display: flex;
+        flex-direction: column;
+      }
+      header .logo-text span:first-child {
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        font-size: 13px;
+        text-transform: uppercase;
+        color: #e5e7eb;
+      }
+      header .logo-text span:last-child {
+        font-size: 11px;
+        color: #9ca3af;
+      }
+      .tabs {
+        display: flex;
+        gap: 8px;
+      }
+      .tab {
+        font-size: 11px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(148,163,184,0.5);
+        color: #e5e7eb;
+        text-decoration: none;
+        background: rgba(15,23,42,0.6);
+      }
+      .tab.active {
+        background: rgba(37,99,235,0.7);
+        border-color: rgba(129,140,248,0.9);
+      }
+      main {
+        padding: 16px;
+        max-width: 900px;
+        margin: 0 auto;
+      }
+      h2 {
+        margin-bottom: 10px;
+        font-size: 18px;
+      }
+      form {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+      label {
+        font-size: 13px;
+        color: #e5e7eb;
+      }
+      textarea {
+        width: 100%;
+        min-height: 60px;
+        border-radius: 8px;
+        border: 1px solid rgba(55,65,81,0.9);
+        background: rgba(15,23,42,0.9);
+        color: #e5e7eb;
+        padding: 8px;
+        font-size: 13px;
+      }
+      .field {
+        margin-bottom: 8px;
+      }
+      button {
+        padding: 8px 14px;
+        border-radius: 12px;
+        border: none;
+        background: linear-gradient(to right, #22c55e, #16a34a);
+        color: white;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 10px 30px rgba(22,163,74,0.8);
+      }
+      button:hover {
+        background: linear-gradient(to right, #16a34a, #15803d);
+      }
+      .quick-replies-label {
+        font-size: 12px;
+        color: #9ca3af;
+        margin-top: -4px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="logo">
+        <div class="logo-icon"></div>
+        <div class="logo-text">
+          <span>IRON GLASS</span>
+          <span>Configuração de mensagens</span>
+        </div>
+      </div>
+      <div class="tabs">
+        <a href="/admin?tab=chat" class="tab">Conversas</a>
+        <a href="/admin?tab=config" class="tab active">Configuração</a>
+        <a href="/admin?tab=program" class="tab">Programados</a>
+          <a href="/admin?tab=calendar" class="tab">Calendário</a>
+      </div>
+    </header>
+    <main>
+      <h2>Mensagens de follow-up e pós-venda</h2>
+      <form method="POST" action="/config">
+        <div class="field">
+          <label>1º follow-up (4h)</label>
+          <textarea name="step0">${String(msg.step0 || '')
+            .replace(/</g, '&lt;')}</textarea>
+        </div>
+        <div class="field">
+          <label>2º follow-up (3 dias)</label>
+          <textarea name="step1">${String(msg.step1 || '')
+            .replace(/</g, '&lt;')}</textarea>
+        </div>
+        <div class="field">
+          <label>3º follow-up (7 dias)</label>
+          <textarea name="step2">${String(msg.step2 || '')
+            .replace(/</g, '&lt;')}</textarea>
+        </div>
+        <div class="field">
+          <label>4º follow-up (15 dias)</label>
+          <textarea name="step3">${String(msg.step3 || '')
+            .replace(/</g, '&lt;')}</textarea>
+        </div>
+        <div class="field">
+          <label>Mensagem extra (após 15 dias / a cada 30 dias)</label>
+          <textarea name="extra">${String(msg.extra || '')
+            .replace(/</g, '&lt;')}</textarea>
+        </div>
+        <div class="field">
+          <label>Mensagem de pós-venda (30 dias)</label>
+          <textarea name="postSale30">${String(msg.postSale30 || '')
+            .replace(/</g, '&lt;')}</textarea>
+        </div>
+        <div class="field">
+          <label>Prefixo para lembrete de agenda</label>
+          <textarea name="agendaPrefix">${String(msg.agendaPrefix || '')
+            .replace(/</g, '&lt;')}</textarea>
+        </div>
+        <div class="field">
+          <label>Respostas rápidas (uma por linha)</label>
+          <textarea name="quickReplies">${quickRepliesText
+            .replace(/</g, '&lt;')}</textarea>
+          <div class="quick-replies-label">
+            Essas respostas aparecem como botões rápidos no chat (apenas para você).
+          </div>
+        </div>
+        <button type="submit">Salvar mensagens</button>
+      </form>
+    </main>
+  </body>
+  </html>
+  `;
+
+  res.send(html);
+}
+
+function renderProgramPage(req, res) {
+  const entries = Object.entries(scheduledStarts || {})
+    .map(([jid, data]) => {
+      return {
+        jid,
+        at: data.at,
+        text: data.text || '',
+      };
+    })
+    .sort((a, b) => (a.at || 0) - (b.at || 0));
+
+  const listHtml = entries
+    .map(
+      (e) => `
+    <tr>
+      <td>${e.jid}</td>
+      <td>${e.at ? new Date(e.at).toLocaleString('pt-BR') : '-'}</td>
+      <td>${(e.text || '').replace(/</g, '&lt;')}</td>
+      <td>
+        <form method="POST" action="/program/cancel" style="display:inline;">
+          <input type="hidden" name="jid" value="${e.jid}" />
+          <button type="submit">Cancelar</button>
+        </form>
+      </td>
+    </tr>
+  `
+    )
+    .join('');
+
+  const html = `
+  <!DOCTYPE html>
+  <html lang="pt-br">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Iron Glass - Programados</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top left, #111827, #020617, #000);
+        color: #e5e7eb;
+        margin: 0;
+        padding: 0;
+      }
+      header {
+        padding: 12px 20px;
+        border-bottom: 1px solid rgba(148,163,184,0.2);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        backdrop-filter: blur(12px);
+        background: linear-gradient(to right, rgba(15,23,42,0.95), rgba(30,64,175,0.6));
+        box-shadow: 0 15px 45px rgba(15,23,42,0.8);
+      }
+      header .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      header .logo-icon {
+        width: 34px;
+        height: 34px;
+        border-radius: 12px;
+        background: radial-gradient(circle at 30% 20%, #facc15, #f97316 40%, #0f172a 75%, #020617 100%);
+        box-shadow:
+          0 0 20px rgba(250,204,21,0.7),
+          0 0 50px rgba(37,99,235,0.6),
+          inset 0 0 15px rgba(15,23,42,0.9);
+        position: relative;
+        overflow: hidden;
+      }
+      header .logo-text {
+        display: flex;
+        flex-direction: column;
+      }
+      header .logo-text span:first-child {
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        font-size: 13px;
+        text-transform: uppercase;
+        color: #e5e7eb;
+      }
+      header .logo-text span:last-child {
+        font-size: 11px;
+        color: #9ca3af;
+      }
+      .tabs {
+        display: flex;
+        gap: 8px;
+      }
+      .tab {
+        font-size: 11px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(148,163,184,0.5);
+        color: #e5e7eb;
+        text-decoration: none;
+        background: rgba(15,23,42,0.6);
+      }
+      .tab.active {
+        background: rgba(37,99,235,0.7);
+        border-color: rgba(129,140,248,0.9);
+      }
+      main {
+        padding: 16px;
+        max-width: 900px;
+        margin: 0 auto;
+      }
+      h2 {
+        margin-bottom: 10px;
+        font-size: 18px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 12px;
+      }
+      th, td {
+        border: 1px solid rgba(55,65,81,0.8);
+        padding: 6px 8px;
+        font-size: 12px;
+      }
+      th {
+        background: rgba(15,23,42,0.9);
+      }
+      button {
+        padding: 4px 10px;
+        border-radius: 999px;
+        border: none;
+        background: linear-gradient(to right, #ef4444, #b91c1c);
+        color: white;
+        font-size: 11px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: linear-gradient(to right, #b91c1c, #7f1d1d);
+      }
+      input[type="text"], input[type="datetime-local"], textarea {
+        width: 100%;
+        border-radius: 8px;
+        border: 1px solid rgba(55,65,81,0.9);
+        background: rgba(15,23,42,0.9);
+        color: #e5e7eb;
+        padding: 6px;
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+      textarea {
+        min-height: 60px;
+      }
+      .form-row {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr;
+        gap: 10px;
+      }
+      .form-row > div {
+        display: flex;
+        flex-direction: column;
+      }
+      label {
+        font-size: 12px;
+        margin-bottom: 4px;
+      }
+      .submit-row {
+        margin-top: 8px;
+      }
+      .info {
+        font-size: 11px;
+        color: #9ca3af;
+        margin-top: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="logo">
+        <div class="logo-icon"></div>
+        <div class="logo-text">
+          <span>IRON GLASS</span>
+          <span>Mensagens programadas</span>
+        </div>
+      </div>
+      <div class="tabs">
+        <a href="/admin?tab=chat" class="tab">Conversas</a>
+        <a href="/admin?tab=config" class="tab">Configuração</a>
+        <a href="/admin?tab=program" class="tab active">Programados</a>
+          <a href="/admin?tab=calendar" class="tab">Calendário</a>
+      </div>
+    </header>
+    <main>
+      <h2>Programar mensagem inicial para um contato</h2>
+      <form method="POST" action="/program">
+        <div class="form-row">
+          <div>
+            <label>Número WhatsApp (com DDD e país, ex: 5599999999999)</label>
+            <input type="text" name="jid" required />
+          </div>
+          <div>
+            <label>Data e horário para envio</label>
+            <input type="datetime-local" name="at" required />
+          </div>
+        </div>
+        <div>
+          <label>Mensagem a ser enviada</label>
+          <textarea name="text" required></textarea>
+        </div>
+        <div class="submit-row">
+          <button type="submit">Programar mensagem</button>
+        </div>
+        <div class="info">
+          Após a mensagem programada ser enviada, o contato entra automaticamente no funil normal (4h, 3, 7, 15 dias).
+        </div>
+      </form>
+
+      <h2>Mensagens programadas ativas</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Contato</th>
+            <th>Data / hora</th>
+            <th>Mensagem</th>
+            <th>Ações</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${
+            listHtml || '<tr><td colspan="4">Nenhuma mensagem programada.</td></tr>'
+          }
+        </tbody>
+      </table>
+    </main>
+  </body>
+  </html>
+  `;
+
+  res.send(html);
+}
+
+
+function renderCalendarPage(req, res) {
+  const html = `
+  <!DOCTYPE html>
+  <html lang="pt-br">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Iron Glass - Calendário</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: radial-gradient(circle at top left, #111827, #020617, #000);
+        color: #e5e7eb;
+        margin: 0;
+        min-height: 100vh;
+      }
+      header {
+        padding: 12px 20px;
+        background: linear-gradient(to right, rgba(15,23,42,0.95), rgba(30,64,175,0.6));
+        box-shadow: 0 15px 45px rgba(15,23,42,0.8);
+        position: sticky;
+        top: 0;
+        z-index: 10;
+      }
+      header .top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .logo { display: flex; align-items: center; gap: 10px; }
+      .logo-icon { width: 34px; height: 34px; border-radius: 12px; background: radial-gradient(circle at top left, rgba(59,130,246,0.9), rgba(30,64,175,0.3)); box-shadow: 0 10px 25px rgba(37,99,235,0.35); }
+      .logo-text span:first-child { font-weight: 800; letter-spacing: 0.12em; font-size: 14px; display:block; }
+      .logo-text span:last-child { color: #93c5fd; font-size: 12px; display:block; margin-top:-2px; }
+      .tabs { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+      .tab {
+        padding: 8px 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(55,65,81,0.7);
+        color: #e5e7eb;
+        text-decoration: none;
+        background: rgba(15,23,42,0.55);
+        font-size: 13px;
+      }
+      .tab.active {
+        background: rgba(37,99,235,0.7);
+        border-color: rgba(129,140,248,0.9);
+      }
+      main { max-width: 1100px; margin: 0 auto; padding: 16px; display: grid; grid-template-columns: 1fr; gap: 14px; }
+      .card {
+        border: 1px solid rgba(55,65,81,0.75);
+        background: rgba(2,6,23,0.72);
+        border-radius: 14px;
+        padding: 14px;
+        box-shadow: 0 18px 55px rgba(0,0,0,0.35);
+      }
+      h2 { margin: 0 0 10px; font-size: 16px; }
+      .muted { color: #9ca3af; font-size: 12px; }
+      label { display:block; font-size: 12px; color: #cbd5e1; margin: 8px 0 6px; }
+      input, textarea, select {
+        width: 100%;
+        border-radius: 10px;
+        border: 1px solid rgba(55,65,81,0.9);
+        background: rgba(15,23,42,0.9);
+        color: #e5e7eb;
+        padding: 10px;
+        font-size: 13px;
+      }
+      textarea { min-height: 110px; resize: vertical; }
+      .row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+      .row2 { display:grid; grid-template-columns: 2fr 1fr 1fr; gap:10px; }
+      .row3 { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
+      @media (max-width: 980px) { .row{grid-template-columns: repeat(2, 1fr);} .row2{grid-template-columns: 1fr;} .row3{grid-template-columns: 1fr;} }
+      .btn {
+        margin-top: 10px;
+        background: linear-gradient(to right, #2563eb, #1d4ed8);
+        border: 1px solid rgba(96,165,250,0.35);
+        color: white;
+        padding: 10px 14px;
+        border-radius: 12px;
+        cursor: pointer;
+        font-weight: 700;
+      }
+      .btn.secondary {
+        background: rgba(15,23,42,0.85);
+        border-color: rgba(55,65,81,0.9);
+        font-weight: 600;
+      }
+      table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+      th, td { padding: 10px 8px; border-bottom: 1px solid rgba(55,65,81,0.65); font-size: 13px; text-align: left; vertical-align: top; }
+      th { color: #93c5fd; font-size: 12px; text-transform: uppercase; letter-spacing: 0.1em; }
+      .tag { display:inline-block; padding: 4px 8px; border-radius: 999px; border:1px solid rgba(55,65,81,0.7); background: rgba(15,23,42,0.6); font-size: 12px; color:#e5e7eb; }
+      .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+      @media (max-width: 980px) { .grid2{grid-template-columns: 1fr;} }
+      .vars code { background: rgba(15,23,42,0.85); border:1px solid rgba(55,65,81,0.8); padding: 2px 6px; border-radius: 8px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="top">
+        <div class="logo">
+          <div class="logo-icon"></div>
+          <div class="logo-text">
+            <span>IRON GLASS</span>
+            <span>Calendário e Templates</span>
+          </div>
+        </div>
+        <div class="muted" id="conn">Status: ...</div>
+      </div>
+      <div class="tabs">
+        <a href="/admin?tab=chat" class="tab">Conversas</a>
+        <a href="/admin?tab=config" class="tab">Configuração</a>
+        <a href="/admin?tab=program" class="tab">Programados</a>
+        <a href="/admin?tab=calendar" class="tab active">Calendário</a>
+      </div>
+    </header>
+
+    <main>
+      <div class="grid2">
+        <div class="card">
+          <h2>✅ Confirmação de agenda (enviar agora + criar lembretes)</h2>
+          <div class="muted">Preencha os dados e o bot envia a confirmação usando o template + agenda lembretes (7/3/1).</div>
+
+          <div class="row2">
+            <div>
+              <label>Número do cliente</label>
+              <input id="a_phone" placeholder="Ex: 5511999999999" />
+            </div>
+            <div>
+              <label>Dia (dd/mm/aaaa)</label>
+              <input id="a_date" placeholder="20/12/2025" />
+            </div>
+            <div>
+              <label>Hora (hh:mm)</label>
+              <input id="a_time" placeholder="14:30" />
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label>Veículo</label>
+              <input id="a_vehicle" placeholder="Ex: BYD SONG" />
+            </div>
+            <div>
+              <label>Produto</label>
+              <input id="a_product" placeholder="Ex: Iron Glass Plus" />
+            </div>
+            <div>
+              <label>Valor total</label>
+              <input id="a_value" placeholder="Ex: R$ 12.900,00" />
+            </div>
+            <div>
+              <label>Sinal recebido</label>
+              <input id="a_deposit" placeholder="Ex: R$ 1.075,00" />
+            </div>
+            <div>
+              <label>Forma de pagamento</label>
+              <input id="a_payment" placeholder="Ex: PIX confirmado" />
+            </div>
+            <div>
+              <label>Endereço</label>
+              <input id="a_address" placeholder="Ex: R. Prof. Atílio Innocenti, 910" />
+            </div>
+          </div>
+
+          <label>Observações (opcional)</label>
+          <input id="a_notes" placeholder="Ex: Box 12, Shopping X" />
+
+          <button class="btn" onclick="sendAgendaConfirm()">Enviar confirmação + programar lembretes</button>
+          <button class="btn secondary" onclick="cancelAgenda()">Cancelar agenda deste número</button>
+
+          <div class="vars muted" style="margin-top:10px">
+            Variáveis do template: 
+            <code>{{DATA}}</code> <code>{{HORA}}</code> <code>{{VEICULO}}</code> <code>{{PRODUTO}}</code> <code>{{VALOR}}</code> <code>{{SINAL}}</code> <code>{{PAGAMENTO}}</code> <code>{{ENDERECO}}</code> <code>{{DIAS}}</code>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>✍️ Templates de mensagens</h2>
+          <div class="muted">Edite e salve. O bot usa esses textos para confirmação, lembretes e pós-venda.</div>
+
+          <label>Template: Confirmação de agenda</label>
+          <textarea id="tpl_confirm"></textarea>
+
+          <label>Template: Seguimento/lembrte de agenda (7/3/1)</label>
+          <textarea id="tpl_reminder"></textarea>
+
+          <label>Template: Pós-venda (30 dias)</label>
+          <textarea id="tpl_post"></textarea>
+
+          <button class="btn" onclick="saveTemplates()">Salvar templates</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>📅 Calendário (agenda + lembretes + pós-venda)</h2>
+        <div class="row3">
+          <div>
+            <label>De (opcional)</label>
+            <input id="f_from" placeholder="2025-12-01" />
+          </div>
+          <div>
+            <label>Até (opcional)</label>
+            <input id="f_to" placeholder="2026-01-31" />
+          </div>
+          <div style="display:flex; align-items:end; gap:10px;">
+            <button class="btn" onclick="loadCalendar()">Atualizar calendário</button>
+            <button class="btn secondary" onclick="loadTemplates()">Recarregar templates</button>
+          </div>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>Quando</th>
+              <th>Tipo</th>
+              <th>Contato</th>
+              <th>Detalhes</th>
+            </tr>
+          </thead>
+          <tbody id="cal_body">
+            <tr><td colspan="4" class="muted">Carregando…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </main>
+
+    <script>
+      async function api(path, opts) {
+        const res = await fetch(path, opts || {});
+        const txt = await res.text();
+        let json = null;
+        try { json = JSON.parse(txt); } catch(e) {}
+        if (!res.ok) throw new Error((json && json.error) ? json.error : txt);
+        return json || {};
+      }
+
+      async function loadTemplates() {
+        const cfg = await api('/api/templates');
+        document.getElementById('tpl_confirm').value = cfg.agendaConfirmTemplate || '';
+        document.getElementById('tpl_reminder').value = cfg.agendaReminderTemplate || '';
+        document.getElementById('tpl_post').value = cfg.postSaleTemplate || cfg.postSale30 || '';
+      }
+
+      async function saveTemplates() {
+        const body = {
+          agendaConfirmTemplate: document.getElementById('tpl_confirm').value,
+          agendaReminderTemplate: document.getElementById('tpl_reminder').value,
+          postSaleTemplate: document.getElementById('tpl_post').value
+        };
+        await api('/api/templates', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(body)
+        });
+        alert('Templates salvos ✅');
+      }
+
+      async function sendAgendaConfirm() {
+        const payload = {
+          phone: document.getElementById('a_phone').value,
+          date: document.getElementById('a_date').value,
+          time: document.getElementById('a_time').value,
+          vehicle: document.getElementById('a_vehicle').value,
+          product: document.getElementById('a_product').value,
+          value: document.getElementById('a_value').value,
+          deposit: document.getElementById('a_deposit').value,
+          payment: document.getElementById('a_payment').value,
+          address: document.getElementById('a_address').value,
+          notes: document.getElementById('a_notes').value
+        };
+        await api('/api/agenda/confirm', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify(payload)
+        });
+        alert('Confirmação enviada + lembretes criados ✅');
+        await loadCalendar();
+      }
+
+      async function cancelAgenda() {
+        const phone = document.getElementById('a_phone').value;
+        if (!phone) return alert('Informe o número');
+        await api('/api/agenda/cancel', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ phone })
+        });
+        alert('Agenda cancelada ✅');
+        await loadCalendar();
+      }
+
+      function typeLabel(t) {
+        if (t === 'AGENDA') return '📅 Agenda';
+        if (t === 'AGENDA_REMINDER') return '📌 Lembrete agenda';
+        if (t === 'POSVENDA') return '🧾 Pós-venda';
+        if (t === 'FUNIL') return '🔁 Funil';
+        if (t === 'PROGRAMADO') return '⏱️ Programado';
+        return t;
+      }
+
+      async function loadCalendar() {
+        const from = document.getElementById('f_from').value.trim();
+        const to = document.getElementById('f_to').value.trim();
+        const qs = new URLSearchParams();
+        if (from) qs.set('from', from);
+        if (to) qs.set('to', to);
+        const data = await api('/api/calendar' + (qs.toString() ? ('?' + qs.toString()) : ''));
+        const tbody = document.getElementById('cal_body');
+        if (!data.events || data.events.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="4" class="muted">Sem eventos no período.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.events.map(ev => {
+          const det = ev.details || {};
+          const detailText = [
+            det.VEICULO || det.veiculo ? ('🚗 ' + (det.VEICULO || det.veiculo)) : '',
+            det.PRODUTO || det.produto ? ('🛡️ ' + (det.PRODUTO || det.produto)) : '',
+            det.ENDERECO || det.endereco ? ('📍 ' + (det.ENDERECO || det.endereco)) : '',
+            ev.daysBefore != null ? ('⏳ ' + ev.daysBefore + ' dia(s)') : '',
+            det.notes ? ('📝 ' + det.notes) : ''
+          ].filter(Boolean).join(' | ');
+          const when = new Date(ev.at).toLocaleString('pt-BR');
+          return '<tr>' +
+            '<td>' + when + '</td>' +
+            '<td><span class="tag">' + typeLabel(ev.type) + '</span></td>' +
+            '<td>' + ev.jid + '</td>' +
+            '<td>' + (detailText || (ev.text || '')) + '</td>' +
+          '</tr>';
+        }).join('');
+      }
+
+      (async () => {
+        try {
+          const st = await api('/api/status');
+          document.getElementById('conn').innerText = 'Status: ' + (st.connected ? 'WhatsApp conectado ✅' : 'Desconectado ⚠️');
+        } catch(e) {}
+        await loadTemplates();
+        await loadCalendar();
+      })();
+    </script>
+  </body>
+  </html>
+  `;
+  res.send(html);
+}
+
+// =================== ROTAS AUXILIARES ===================
+
+app.get('/chats/:jid', (req, res) => {
+  const jid = req.params.jid;
+  const chat = chatStore[jid] || { jid, messages: [], unread: 0, lastMessageAt: 0, pinned: false, name: jid };
+
+  // Evita travar o navegador: por padrão, devolve só os últimos N itens
+  const limit = Math.max(1, Math.min(2000, Number(req.query.limit || 400)));
+  const msgs = Array.isArray(chat.messages) ? chat.messages : [];
+  const start = Math.max(0, msgs.length - limit);
+  const slice = msgs.slice(start);
+
+  res.json({
+    jid: chat.jid,
+    name: chat.name || chat.jid,
+    unread: Number(chat.unread || 0),
+    lastMessageAt: chat.lastMessageAt || 0,
+    pinned: chat.pinned === true,
+    messages: slice,
+    totalMessages: msgs.length
+  });
+});
+
+app.post('/chats/:jid/read', (req, res) => {
+  const jid = req.params.jid;
+  markChatRead(jid);
+  res.json({ ok: true });
+});
+
+
+app.get('/api/chats', (req, res) => {
+  const metas = Object.values(chatStore || {}).map((c) => {
+    const lastMsg = (c.messages && c.messages.length) ? c.messages[c.messages.length - 1].text : '';
+    return {
+      jid: c.jid,
+      name: c.name || c.jid,
+      unread: Number(c.unread || 0),
+      lastMessageAt: c.lastMessageAt || 0,
+      lastMessage: lastMsg || '',
+      pinned: c.pinned === true,
+    };
+  });
+  metas.sort((a, b) => {
+    if ((a.pinned ? 1 : 0) !== (b.pinned ? 1 : 0)) return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0);
+    return Number(b.lastMessageAt || 0) - Number(a.lastMessageAt || 0);
+  });
+  res.json({ ok: true, chats: metas });
+});
+
+
+app.post('/send', async (req, res) => {
+  try {
+    // Acepta ambos nombres por si el front manda "message" o "text"
+    const rawJid = String(req.body.jid || req.body.to || '').trim();
+    const text = String(req.body.text ?? req.body.message ?? '').trim();
+
+    if (!rawJid || !text) return res.status(400).json({ ok: false, error: 'missing_jid_or_text' });
+
+    // Normaliza JID (si viene solo número)
+    const jid = rawJid.includes('@') ? rawJid : `${rawJid.replace(/\D/g, '')}@s.whatsapp.net`;
+
+    // 1) ENVÍA por WhatsApp
+    await safeSendText(jid, text);
+
+    // 2) GUARDA en historial del panel (esto es lo que te falta)
+    //    Lo guardamos como "fromMe: true"
+    upsertChatMessage(jid, true, text, Date.now());
+
+    // (Opcional) marca como leído en el panel (para que no quede unread raro)
+    // markChatRead(jid);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[SEND] Error:', e?.message || e);
+    return res.status(500).json({ ok: false, error: 'send_failed' });
+  }
+});
+
+
+
+
+app.post('/api/chat/pin', (req, res) => {
+  try {
+    const body = req.body || {};
+    const jid = String(body.jid || '').trim();
+    const pinned = !!body.pinned;
+    if (!jid) return res.status(400).json({ error: 'jid inválido' });
+
+    const chat = ensureChat(jid);
+    chat.pinned = pinned;
+    saveChats();
+
+    const lastMsg = (chat.messages && chat.messages.length) ? chat.messages[chat.messages.length - 1].text : '';
+    const meta = {
+      jid: chat.jid,
+      name: chat.name || chat.jid,
+      unread: chat.unread || 0,
+      lastMessageAt: chat.lastMessageAt || Date.now(),
+      lastMessage: lastMsg || '',
+      pinned: chat.pinned === true,
+    };
+    sseBroadcast({ type: 'chat', jid: chat.jid, meta });
+    return res.json(meta);
+  } catch (e) {
+    return res.status(500).json({ error: 'erro ao pin' });
+  }
+});
+
+app.get('/api/templates', (req, res) => {
+  // Retorna templates atuais (com fallback para defaults)
+  const cfg = messagesConfig || defaultMessages();
+  res.json({
+    agendaConfirmTemplate: cfg.agendaConfirmTemplate || defaultMessages().agendaConfirmTemplate,
+    agendaReminderTemplate: cfg.agendaReminderTemplate || defaultMessages().agendaReminderTemplate,
+    postSaleTemplate: cfg.postSaleTemplate || cfg.postSale30 || defaultMessages().postSale30,
+    postSale30: cfg.postSale30 || defaultMessages().postSale30,
+  });
+});
+
+app.post('/api/templates', (req, res) => {
+  const body = req.body || {};
+  messagesConfig = messagesConfig || defaultMessages();
+
+  if (typeof body.agendaConfirmTemplate === 'string') {
+    messagesConfig.agendaConfirmTemplate = body.agendaConfirmTemplate;
+  }
+  if (typeof body.agendaReminderTemplate === 'string') {
+    messagesConfig.agendaReminderTemplate = body.agendaReminderTemplate;
+  }
+  if (typeof body.postSaleTemplate === 'string') {
+    messagesConfig.postSaleTemplate = body.postSaleTemplate;
+    // compat: também atualiza postSale30
+    messagesConfig.postSale30 = body.postSaleTemplate;
   }
 
-  agendas[jid] = list.sort((a, b) => a.at - b.at);
+  saveMessages();
+  res.json({ ok: true });
+});
+
+function parseBRDateTime(dateStr, timeStr) {
+  const m = String(dateStr || '').match(/(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})/);
+  if (!m) return null;
+  let dd = parseInt(m[1], 10);
+  let mm = parseInt(m[2], 10);
+  let yy = parseInt(m[3], 10);
+  if (yy < 100) yy += 2000;
+
+  let hh = 9, mi = 0;
+  const t = String(timeStr || '').match(/(\d{1,2})\s*[:h]\s*(\d{2})/i);
+  if (t) {
+    hh = parseInt(t[1], 10);
+    mi = parseInt(t[2], 10);
+  }
+  const dt = new Date(yy, mm - 1, dd, hh, mi, 0, 0);
+  return dt.getTime();
+}
+
+app.post('/api/agenda/confirm', async (req, res) => {
+  try {
+    if (!sock) return res.status(500).json({ error: 'WhatsApp não inicializado' });
+
+    const b = req.body || {};
+    const jid = normalizeToJid(b.phone);
+    if (!jid) return res.status(400).json({ error: 'Número inválido' });
+
+    const ts = parseBRDateTime(b.date, b.time);
+    if (!ts) return res.status(400).json({ error: 'Data inválida. Use dd/mm/aaaa' });
+
+    const details = {
+      VEICULO: b.vehicle || '',
+      PRODUTO: b.product || '',
+      VALOR: b.value || '',
+      SINAL: b.deposit || '',
+      PAGAMENTO: b.payment || '',
+      ENDERECO: b.address || '',
+      notes: b.notes || '',
+    };
+
+    // Envia confirmação usando template
+    const vars = {
+      DATA: formatBRDate(ts),
+      HORA: formatBRTime(ts),
+      VEICULO: details.VEICULO,
+      PRODUTO: details.PRODUTO,
+      VALOR: details.VALOR,
+      SINAL: details.SINAL,
+      PAGAMENTO: details.PAGAMENTO,
+      ENDERECO: details.ENDERECO,
+      DIAS: '',
+    };
+
+    const tpl =
+      messagesConfig.agendaConfirmTemplate ||
+      defaultMessages().agendaConfirmTemplate;
+
+    const msg = renderTemplate(tpl, vars).trim();
+    if (!msg) return res.status(400).json({ error: 'Template de confirmação está vazio' });
+
+    await sendText(jid, msg);
+
+    // Guarda detalhes + cria lembretes
+    scheduleAgenda(jid, ts, details);
+
+    // Também registra no painel
+    upsertChatMessage(jid, true, msg, Date.now());
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Erro /api/agenda/confirm:', e);
+    res.status(500).json({ error: 'Falha ao confirmar agenda' });
+  }
+});
+
+app.post('/api/agenda/cancel', (req, res) => {
+  const b = req.body || {};
+  const jid = normalizeToJid(b.phone || b.jid);
+  if (!jid) return res.status(400).json({ error: 'Número inválido' });
+
+  delete agendas[jid];
   saveAgendas();
-  console.log('[AGENDA] Lembretes programados para', jid, '->', list.map(x => x.key).join(', '));
+  res.json({ ok: true });
+});
+
+app.get('/api/calendar', (req, res) => {
+  const from = String(req.query.from || '').trim(); // YYYY-MM-DD
+  const to = String(req.query.to || '').trim();
+
+  let fromTs = null, toTs = null;
+  if (from) {
+    const m = from.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (m) fromTs = new Date(parseInt(m[1]), parseInt(m[2])-1, parseInt(m[3]), 0,0,0,0).getTime();
+  }
+  if (to) {
+    const m = to.match(/(\d{4})-(\d{2})-(\d{2})/);
+    if (m) toTs = new Date(parseInt(m[1]), parseInt(m[2])-1, parseInt(m[3]), 23,59,59,999).getTime();
+  }
+
+  const events = [];
+
+  // Agenda + lembretes
+  for (const [jid, raw] of Object.entries(agendas || {})) {
+    const c = getAgendaContainer(jid);
+    if (!c) continue;
+
+    if (c.appointmentTs) {
+      events.push({
+        type: 'AGENDA',
+        at: c.appointmentTs,
+        jid,
+        details: c.details || {},
+      });
+    }
+    for (const r of (c.reminders || [])) {
+      events.push({
+        type: 'AGENDA_REMINDER',
+        at: r.at,
+        jid,
+        daysBefore: r.daysBefore,
+        details: c.details || {},
+      });
+    }
+  }
+
+  // Funil / pós-venda (próximo envio)
+  for (const [jid, c] of Object.entries(clients || {})) {
+    if (!c || !c.nextFollowUpAt) continue;
+    const type = c.isClient ? 'POSVENDA' : 'FUNIL';
+    events.push({
+      type,
+      at: c.nextFollowUpAt,
+      jid,
+      details: {},
+      text: c.isClient ? 'Mensagem de pós-venda agendada' : ('Próximo follow-up (etapa ' + (c.stepIndex || 0) + ')'),
+    });
+  }
+
+  // Programados (mensagem inicial)
+  for (const [jid, p] of Object.entries(programados || {})) {
+    if (!p || !p.at) continue;
+    events.push({
+      type: 'PROGRAMADO',
+      at: p.at,
+      jid,
+      text: p.text || '',
+      details: {},
+    });
+  }
+
+  // filtro
+  const filtered = events.filter(ev => {
+    if (fromTs && ev.at < fromTs) return false;
+    if (toTs && ev.at > toTs) return false;
+    return true;
+  }).sort((a,b) => a.at - b.at);
+
+  res.json({ events: filtered });
+});
+
+
+app.post('/config', (req, res) => {
+  const body = req.body || {};
+  messagesConfig.step0 = body.step0 || messagesConfig.step0;
+  messagesConfig.step1 = body.step1 || messagesConfig.step1;
+  messagesConfig.step2 = body.step2 || messagesConfig.step2;
+  messagesConfig.step3 = body.step3 || messagesConfig.step3;
+  messagesConfig.extra = body.extra || messagesConfig.extra;
+  messagesConfig.postSale30 = body.postSale30 || messagesConfig.postSale30;
+  messagesConfig.agendaPrefix = body.agendaPrefix || messagesConfig.agendaPrefix;
+  messagesConfig.quickReplies = (body.quickReplies || '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  saveMessages();
+  res.redirect('/admin?tab=config');
+});
+
+app.post('/program', (req, res) => {
+  const { jid, at, text } = req.body || {};
+  if (!jid || !at || !text) {
+    return res.status(400).send('Campos obrigatórios faltando');
+  }
+
+  const normalized = jid.replace(/\D/g, '') + '@s.whatsapp.net';
+  const ts = new Date(at).getTime();
+  if (isNaN(ts)) {
+    return res.status(400).send('Data/hora inválida');
+  }
+
+  scheduledStarts[normalized] = {
+    at: ts,
+    text: text.trim(),
+  };
+  saveProgramados();
+
+  console.log(
+    '[PROGRAM] Mensagem inicial programada para',
+    normalized,
+    'em',
+    new Date(ts).toISOString()
+  );
+
+  res.redirect('/admin?tab=program');
+});
+
+app.post('/program/cancel', (req, res) => {
+  const { jid } = req.body || {};
+  if (jid && scheduledStarts[jid]) {
+    delete scheduledStarts[jid];
+    saveProgramados();
+    scheduledQueue.delete(jid);
+    console.log('[PROGRAM] Cancelada mensagem programada para', jid);
+  }
+  res.redirect('/admin?tab=program');
+});
+
+// =================== BEEP LOOP (NODE) ===================
+
+let beepLoop = null;
+let sendingNow = false;
+
+function playBeep() {
+  // Som real é no front-end (<audio>); aqui é apenas placeholder.
+}
+
+function startBeepLoop() {
+  if (beepLoop) return;
+  beepLoop = setInterval(() => {
+    if (!hasUnread()) {
+      stopBeepLoop();
+      return;
+    }
+    playBeep();
+  }, 5000);
+}
+
+function stopBeepLoop() {
+  if (beepLoop) {
+    clearInterval(beepLoop);
+    beepLoop = null;
+  }
+}
+
+function updateBeepLoop() {
+  if (hasUnread()) startBeepLoop();
+  else stopBeepLoop();
+}
+
+// =================== AGENDA & PROGRAMADOS HELPERS ===================
+
+
+function scheduleAgenda(jid, appointmentTs, details = {}) {
+  const reminders = AGENDA_OFFSETS_DAYS.map((daysBefore) => {
+    const at = appointmentTs - daysBefore * DAY_MS;
+    const key = `${appointmentTs}-${daysBefore}`;
+    return { at, key, daysBefore, appointmentTs };
+  }).filter((r) => r.at > Date.now());
+
+  const prev = getAgendaContainer(jid) || { reminders: [], details: {}, appointmentTs: null };
+  const mergedDetails = { ...(prev.details || {}), ...(details || {}) };
+
+  const container = {
+    appointmentTs,
+    details: mergedDetails,
+    reminders,
+  };
+
+  setAgendaContainer(jid, container);
+
+
+  // Atualiza status do cliente e agenda início do pós-venda (+30 dias após a instalação)
+  try {
+    const c = clients[jid] || {};
+    c.appointmentTs = appointmentTs;
+    c.agendaConfirmedAt = Date.now();
+    c.postSaleStartAt = appointmentTs + 30 * DAY_MS;
+    clients[jid] = c;
+    saveClients();
+    // Para de enviar funil automaticamente após confirmar agenda
+    stopFollowUp(jid);
+  } catch (_) {}
+
+  console.log(
+    '[AGENDA] Criada agenda para',
+    jid,
+    '->',
+    new Date(appointmentTs).toISOString()
+  );
 }
 
 function cancelAgenda(jid) {
-  if (!jid) return;
-
   if (agendas[jid]) {
     delete agendas[jid];
     saveAgendas();
   }
-
-  // ✅ remove lembretes já enfileirados desse cliente
-  messageQueue = messageQueue.filter(m => !(m.jid === jid && m.kind === 'agenda'));
-
   console.log('[AGENDA] Agenda cancelada (fila limpa) para', jid);
 }
 
@@ -384,11 +2866,27 @@ function startScheduleChecker() {
       if (paused[jid]) continue;
       if (!c.nextFollowUpAt) continue;
       if (now >= c.nextFollowUpAt) {
-        const already = messageQueue.some(m => m.jid === jid && m.kind === 'funil');
+        const already = messageQueue.some(
+          (m) => m.jid === jid && m.kind === 'funil'
+        );
         if (!already) {
           messageQueue.push({ jid, kind: 'funil' });
           console.log('[QUEUE] Funil enfileirado para', jid);
         }
+      }
+    }
+
+
+    // pós-venda (início automático 30 dias após agenda)
+    for (const [jid, c] of Object.entries(clients)) {
+      if (blocked[jid]) continue;
+      if (paused[jid]) continue;
+      if (!c.postSaleStartAt) continue;
+      if (now >= c.postSaleStartAt) {
+        console.log('[POS] Iniciando pós-venda automático para', jid);
+        startPostSaleMonthly(jid);
+        delete c.postSaleStartAt;
+        saveClients();
       }
     }
 
@@ -397,7 +2895,9 @@ function startScheduleChecker() {
       if (!Array.isArray(arr)) continue;
       for (const item of arr) {
         if (now >= item.at) {
-          const already = messageQueue.some(m => m.jid === jid && m.kind === 'agenda' && m.key === item.key);
+          const already = messageQueue.some(
+            (m) => m.jid === jid && m.kind === 'agenda' && m.key === item.key
+          );
           if (!already) {
             messageQueue.push({ jid, kind: 'agenda', key: item.key });
             console.log('[QUEUE] Agenda enfileirada para', jid, item.key);
@@ -406,12 +2906,14 @@ function startScheduleChecker() {
       }
     }
 
-    // mensagens iniciais programadas (primeiro contato)
+    // mensagens iniciais programadas
     for (const [jid, s] of Object.entries(scheduledStarts || {})) {
       if (!s || !s.at) continue;
 
       if (now >= s.at) {
-        const already = messageQueue.some(m => m.jid === jid && m.kind === 'startFunil');
+        const already = messageQueue.some(
+          (m) => m.jid === jid && m.kind === 'startFunil'
+        );
         if (!already && !scheduledQueue.has(jid)) {
           messageQueue.push({ jid, kind: 'startFunil' });
           scheduledQueue.add(jid);
@@ -419,21 +2921,17 @@ function startScheduleChecker() {
         }
       }
     }
-
   }, 60 * 1000);
 }
 
-// =================== SENDER ===================
-
-let sendingNow = false;
-
 function startMessageSender() {
+  if (DISABLE_AUTOMATION) return;
+
   setInterval(async () => {
-    if (!sock || sendingNow) return;
+    if (sendingNow) return;
     const item = messageQueue.shift();
     if (!item) return;
 
-    // ✅ se não está conectado, devolve pra fila e espera
     if (!isConnected) {
       messageQueue.unshift(item);
       return;
@@ -446,24 +2944,27 @@ function startMessageSender() {
     }
 
     sendingNow = true;
-
-    // jitter aleatório 5–55s
-    const jitterMs = 5000 + Math.floor(Math.random() * 50000);
-    await new Promise(r => setTimeout(r, jitterMs));
+    const jitterMs = 8000 + Math.floor(Math.random() * 90000);
+    await new Promise((r) => setTimeout(r, jitterMs));
 
     try {
       const { jid, kind, key } = item;
 
       if (kind === 'funil') {
         const c = clients[jid];
-        if (!c) { sendingNow = false; return; }
+        if (!c) {
+          sendingNow = false;
+          return;
+        }
 
         let msgKey = 'extra';
 
-        // Cliente pós-venda: usa sempre a mensagem específica de indicação
         if (c.isClient) {
           msgKey = 'postSale30';
-        } else if (c.stepIndex >= 0 && c.stepIndex <= STEPS_DAYS.length - 1) {
+        } else if (
+          c.stepIndex >= 0 &&
+          c.stepIndex <= STEPS_DAYS.length - 1
+        ) {
           msgKey = `step${c.stepIndex}`;
         }
 
@@ -476,25 +2977,72 @@ function startMessageSender() {
         c.ignoreNextFromMe = true;
         saveClients();
 
-        await sendText(jid, texto);
+        if (!DRY_RUN) {
+          await sendText(jid, texto);
+        } else {
+          console.log('[DRY_RUN] Enviaria para', jid, '->', texto);
+        }
 
         const sentAt = Date.now();
         c.lastContact = sentAt;
 
         if (c.isClient) {
-          // fluxo mensal pós-venda: sempre a cada 30 dias
           c.stepIndex = STEPS_DAYS.length;
           c.nextFollowUpAt = sentAt + EXTRA_INTERVAL_DAYS * DAY_MS;
-          console.log('[PÓS-VENDA] Follow-up mensal enviado para', jid, '-> próxima em', EXTRA_INTERVAL_DAYS, 'dias');
-        } else if (c.stepIndex < STEPS_DAYS.length - 1) {
-          c.stepIndex += 1;
-          const dias = STEPS_DAYS[c.stepIndex];
-          c.nextFollowUpAt = sentAt + dias * DAY_MS;
-          console.log('[FUNIL] Follow-up enviado para', jid, '-> próxima etapa em', dias, 'dias');
+          console.log(
+            '[PÓS-VENDA] Follow-up mensal enviado para',
+            jid,
+            '-> próxima em',
+            EXTRA_INTERVAL_DAYS,
+            'dias'
+          );
+        } else if (c.stepIndex === 0) {
+          if (STEPS_DAYS.length > 0) {
+            c.stepIndex = 1;
+            const dias = STEPS_DAYS[0];
+            c.nextFollowUpAt = sentAt + dias * DAY_MS;
+            console.log(
+              '[FUNIL] Follow-up (4h) enviado para',
+              jid,
+              '-> próxima etapa em',
+              dias,
+              'dias'
+            );
+          } else {
+            c.stepIndex = 1;
+            c.nextFollowUpAt = sentAt + EXTRA_INTERVAL_DAYS * DAY_MS;
+            console.log(
+              '[FUNIL] Follow-up (4h) enviado para',
+              jid,
+              '-> próxima etapa em',
+              EXTRA_INTERVAL_DAYS,
+              'dias'
+            );
+          }
         } else {
-          c.stepIndex += 1;
-          c.nextFollowUpAt = sentAt + EXTRA_INTERVAL_DAYS * DAY_MS;
-          console.log('[FUNIL] Follow-up enviado para', jid, '-> agora será a cada', EXTRA_INTERVAL_DAYS, 'dias');
+          const idx = c.stepIndex;
+          if (idx < STEPS_DAYS.length) {
+            c.stepIndex += 1;
+            const dias = STEPS_DAYS[idx];
+            c.nextFollowUpAt = sentAt + dias * DAY_MS;
+            console.log(
+              '[FUNIL] Follow-up enviado para',
+              jid,
+              '-> próxima etapa em',
+              dias,
+              'dias'
+            );
+          } else {
+            c.stepIndex += 1;
+            c.nextFollowUpAt = sentAt + EXTRA_INTERVAL_DAYS * DAY_MS;
+            console.log(
+              '[FUNIL] Follow-up enviado para',
+              jid,
+              '-> agora será a cada',
+              EXTRA_INTERVAL_DAYS,
+              'dias'
+            );
+          }
         }
 
         saveClients();
@@ -504,95 +3052,224 @@ function startMessageSender() {
         const arr = agendas[jid];
 
         if (!Array.isArray(arr)) {
-          console.log('[AGENDA] Ignorado lembrete porque agenda não existe mais ->', jid, key);
-          return;
-        }
+          console.log(
+            '[AGENDA] Ignorado lembrete porque agenda não existe mais ->',
+            jid
+          );
+        } else {
+          const idx = arr.findIndex((x) => x.key === key);
+          if (idx === -1) {
+            console.log('[AGENDA] Lembrete não encontrado ->', jid, key);
+          } else {
+            const itemAgenda = arr[idx];
 
-        const item = arr.find(x => x.key === key);
-        if (!item) {
-          console.log('[AGENDA] Ignorado lembrete porque chave não encontrada ->', jid, key);
-          return;
-        }
+            // Variáveis para template
+            const appointmentTs =
+              itemAgenda.appointmentTs ||
+              Number(String(itemAgenda.key || '').split('-')[0]) ||
+              (container && container.appointmentTs) ||
+              null;
 
-        const baseText = messagesConfig[key] || '📅 Lembrete do seu agendamento Iron Glass.';
+            const det = (container && container.details) ? container.details : {};
+            const vars = {
+              DATA: appointmentTs ? formatBRDate(appointmentTs) : '',
+              HORA: appointmentTs ? formatBRTime(appointmentTs) : '',
+              DIAS: itemAgenda.daysBefore ?? '',
+              VEICULO: det.VEICULO || det.veiculo || '',
+              PRODUTO: det.PRODUTO || det.produto || '',
+              VALOR: det.VALOR || det.valor || '',
+              SINAL: det.SINAL || det.sinal || '',
+              PAGAMENTO: det.PAGAMENTO || det.pagamento || '',
+              ENDERECO: det.ENDERECO || det.endereco || det.address || '',
+            };
 
-        // Monta dados para o template
-        const data = Object.assign({}, item.data || {});
+            const tpl =
+              messagesConfig.agendaReminderTemplate ||
+              messagesConfig.agendaPrefix ||
+              'Lembrete da sua instalação Iron Glass.';
 
-        // Se não tiver DATA/HORA salvos, tenta reconstruir a partir do horário do lembrete
-        if ((!data.DATA || !data.HORA) && item.at) {
-          let offsetDays = null;
-          if (key === 'agenda0') offsetDays = 7;
-          else if (key === 'agenda1') offsetDays = 3;
-          else if (key === 'agenda2') offsetDays = 1;
+            const baseMsg = renderTemplate(tpl, vars).trim() || 'Lembrete da sua instalação Iron Glass.';
 
-          if (offsetDays != null) {
-            const apptTs = item.at + offsetDays * DAY_MS;
-            const d = new Date(apptTs);
-            const dd = String(d.getDate()).padStart(2, '0');
-            const mm = String(d.getMonth() + 1).padStart(2, '0');
-            const yyyy = d.getFullYear();
-            const hh = String(d.getHours()).padStart(2, '0');
-            const min = String(d.getMinutes()).padStart(2, '0');
+            if (!DRY_RUN) {
+              await sendText(jid, baseMsg);
+            } else {
+              console.log(
+                '[DRY_RUN] Lembrete de agenda para',
+                jid,
+                '->',
+                baseMsg
+              );
+            }
 
-            data.DATA = `${dd}/${mm}/${yyyy}`;
-            data.HORA = `${hh}:${min}`;
+            arr.splice(idx, 1);
+            const cont = getAgendaContainer(jid);
+            if (cont && !Array.isArray(cont)) {
+              cont.reminders = arr;
+              setAgendaContainer(jid, cont);
+            } else {
+              agendas[jid] = arr;
+              saveAgendas();
+            }
+
+            console.log('[AGENDA] Lembrete enviado ->', jid, itemAgenda.key);
           }
         }
-
-        const texto = applyTemplate(baseText, data);
-
-        await sendText(jid, texto);
-
-        agendas[jid] = arr.filter(x => x.key !== key);
-        if (agendas[jid].length === 0) delete agendas[jid];
-        saveAgendas();
-
-        console.log('[AGENDA] Lembrete enviado ->', jid, key);
       }
 
       if (kind === 'startFunil') {
         const data = scheduledStarts[jid];
 
         if (!data || !data.at) {
-          console.log('[PROGRAM] Nenhum dado encontrado para mensagem programada ->', jid);
+          console.log(
+            '[PROGRAM] Nenhum dado encontrado para mensagem programada ->',
+            jid
+          );
           scheduledQueue.delete(jid);
-          return;
-        }
-
-        if (blocked[jid]) {
-          console.log('[PROGRAM] Cliente bloqueado; ignorando mensagem programada ->', jid);
+        } else if (blocked[jid]) {
+          console.log(
+            '[PROGRAM] Cliente bloqueado; ignorando mensagem programada ->',
+            jid
+          );
           delete scheduledStarts[jid];
           saveProgramados();
           scheduledQueue.delete(jid);
-          return;
+        } else {
+          const texto =
+            (data.text && data.text.trim()) ||
+            messagesConfig.step0 ||
+            'Olá! Tudo bem?';
+
+          if (!DRY_RUN) {
+            await sendText(jid, texto);
+          } else {
+            console.log(
+              '[DRY_RUN] Mensagem inicial programada para',
+              jid,
+              '->',
+              texto
+            );
+          }
+
+          console.log(
+            '[PROGRAM] Mensagem inicial programada enviada ->',
+            jid
+          );
+
+          startFollowUp(jid);
+
+          delete scheduledStarts[jid];
+          saveProgramados();
+          scheduledQueue.delete(jid);
         }
-
-        const texto =
-          (data.text && data.text.trim()) ||
-          messagesConfig.step0 ||
-          'Olá! Tudo bem?';
-
-        await sendText(jid, texto);
-        console.log('[PROGRAM] Mensagem inicial programada enviada ->', jid);
-
-        // depois da mensagem programada, entra no funil normal
-        startFollowUp(jid);
-
-        delete scheduledStarts[jid];
-        saveProgramados();
-        scheduledQueue.delete(jid);
       }
-
-
     } catch (err) {
       console.error('[ERRO] Ao enviar mensagem para', item.jid, err?.message || err);
-      // devolve pra fila pra tentar depois
       messageQueue.unshift(item);
     } finally {
       sendingNow = false;
     }
   }, 60 * 1000);
+}
+
+// =================== FUNIL ===================
+
+function startFollowUp(jid) {
+  if (blocked[jid]) return;
+
+  const now = Date.now();
+  clients[jid] = {
+    lastContact: now,
+    stepIndex: 0,
+    nextFollowUpAt: now + FIRST_STEP_MS,
+    ignoreNextFromMe: false,
+  };
+  console.log(
+    '[FUNIL] Iniciado / reiniciado para',
+    jid,
+    '-> próximo em 4 horas'
+  );
+  saveClients();
+}
+
+function startPostSaleMonthly(jid) {
+  if (blocked[jid]) return;
+
+  const now = Date.now();
+  const c = clients[jid] || {};
+
+  c.isClient = true;
+  c.stepIndex = STEPS_DAYS.length;
+  c.lastContact = now;
+  c.nextFollowUpAt = now + EXTRA_INTERVAL_DAYS * DAY_MS;
+  c.ignoreNextFromMe = false;
+
+  clients[jid] = c;
+  saveClients();
+
+  if (paused[jid]) {
+    delete paused[jid];
+    savePaused();
+  }
+
+  console.log(
+    '[PÓS-VENDA] Seguimento mensal ativado para',
+    jid,
+    '-> próxima em',
+    EXTRA_INTERVAL_DAYS,
+    'dias'
+  );
+}
+
+function stopFollowUp(jid) {
+  if (clients[jid]) {
+    delete clients[jid];
+    saveClients();
+  }
+}
+
+function pauseFollowUp(jid) {
+  paused[jid] = { pausedAt: Date.now() };
+  savePaused();
+
+  messageQueue = messageQueue.filter(
+    (item) => !(item.jid === jid && item.kind === 'funil')
+  );
+
+  stopFollowUp(jid);
+  console.log('[FUNIL] Pausado para', jid);
+}
+
+function blockFollowUp(jid, reason = 'STOP') {
+  blocked[jid] = { blockedAt: Date.now(), reason };
+  saveBlocked();
+
+  pauseFollowUp(jid);
+  stopFollowUp(jid);
+  cancelAgenda(jid);
+
+  if (scheduledStarts[jid]) {
+    delete scheduledStarts[jid];
+    saveProgramados();
+    scheduledQueue.delete(jid);
+  }
+
+  console.log(
+    '[BLOCK] Cliente bloqueado de todos os fluxos ->',
+    jid,
+    'motivo:',
+    reason
+  );
+}
+
+// =================== WHATSAPP HELPERS ===================
+
+async function sendText(jid, text) {
+  if (!sock) throw new Error('Socket WhatsApp não está pronto');
+  const clean = text.replace(/\n\n+/g, '\n\n').trim();
+  const res = await sock.sendMessage(jid, { text: clean });
+  botSentRecently.add(jid);
+  setTimeout(() => botSentRecently.delete(jid), 5000);
+  return res;
 }
 
 // =================== WHATSAPP HANDLER ===================
@@ -607,7 +3284,6 @@ function setupMessageHandler() {
     const remoteJid = msg.key.remoteJid;
     const fromMe = msg.key.fromMe;
 
-    // ✅ normaliza JID quando WhatsApp manda @lid (Linked ID)
     let jid = remoteJid;
     if (remoteJid && remoteJid.endsWith('@lid')) {
       const real = msg.key.senderPn || msg.key.participant;
@@ -617,55 +3293,61 @@ function setupMessageHandler() {
     if (
       !remoteJid ||
       remoteJid === 'status@broadcast' ||
-      remoteJid.endsWith('@g.us') ||
-      remoteJid.endsWith('@newsletter')
-    ) return;
-
-    // ✅ IGNORAR HISTÓRICO / REPLAY
-    const msgMs = getMsgMs(msg);
-    if (Date.now() - msgMs > RECENT_WINDOW_MS) {
-      console.log('[HIST] Ignorando msg antiga ->', jid);
+      remoteJid.endsWith('@newsletter') ||
+      msg.key.remoteJid === 'status@broadcast'
+    ) {
       return;
     }
 
-    const body =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
-      '';
+    const body = cleanText(getMsgBody(msg));
+    const lower = body.toLowerCase();
+    const ts = getMsgMs(msg);
 
-    const lower = (body || '').toLowerCase();
+    if (!body) return;
+
+    if (Date.now() - ts > RECENT_WINDOW_MS) {
+      console.log('[IGNORADO] Mensagem antiga (replay) de', jid);
+      return;
+    }
+
     const c = clients[jid];
 
-    // --------- MINHA MSG (SOMENTE VOCÊ CONTROLA STOP/PAUSE/AGENDA) ---------
     if (fromMe) {
       if (botSentRecently.has(jid)) {
         console.log('[BOT MSG] Ignorada (botSentRecently) ->', jid);
         return;
       }
 
-      // comandos manuais SEMPRE antes do ignoreNextFromMe
       if (lower.includes(CMD_STOP)) {
-        if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
+        if (c && c.ignoreNextFromMe) {
+          c.ignoreNextFromMe = false;
+          saveClients();
+        }
         blockFollowUp(jid, 'MANUAL_STOP');
         return;
       }
+
       if (lower.includes(CMD_PAUSE)) {
-        if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
+        if (c && c.ignoreNextFromMe) {
+          c.ignoreNextFromMe = false;
+          saveClients();
+        }
         pauseFollowUp(jid);
         return;
       }
 
       if (lower.includes(CMD_CLIENT)) {
-        if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
+        if (c && c.ignoreNextFromMe) {
+          c.ignoreNextFromMe = false;
+          saveClients();
+        }
 
-        // Pós-venda: marca como cliente, cancela agenda e funil normal e ativa fluxo mensal
         cancelAgenda(jid);
 
-        // remove qualquer follow-up de funil já enfileirado
-        messageQueue = messageQueue.filter(item => !(item.jid === jid && item.kind === 'funil'));
+        messageQueue = messageQueue.filter(
+          (item) => !(item.jid === jid && item.kind === 'funil')
+        );
 
-        // descarta mensagem inicial programada, se existir
         if (scheduledStarts[jid]) {
           delete scheduledStarts[jid];
           saveProgramados();
@@ -673,21 +3355,51 @@ function setupMessageHandler() {
         }
 
         startPostSaleMonthly(jid);
-        console.log('[PÓS-VENDA] Marcado como cliente via comando #cliente ->', jid);
+        console.log(
+          '[PÓS-VENDA] Marcado como cliente via comando #cliente ->',
+          jid
+        );
         return;
       }
 
-      // detecta confirmação manual de agenda
+
+      // ===== comandos admin (usar preferencialmente em "Mensagem para mim") =====
+      if (lower.startsWith(CMD_STATS) && isAdminContext(jid)) {
+        const s = computeStats();
+        const txt =
+          `📊 *Iron Glass • Stats*\n` +
+          `• Total contatos: ${s.total}\n` +
+          `• Ativos: ${s.active}\n` +
+          `• Clientes (pós-venda): ${s.clients}\n` +
+          `• Com agenda: ${s.agendas}\n` +
+          `• Pausados: ${s.paused}\n` +
+          `• Bloqueados: ${s.blocked}`;
+        await sendText(jid, txt);
+        upsertChatMessage(jid, true, txt, Date.now());
+        return;
+      }
+
+      if (lower.startsWith(CMD_EXPORT) && isAdminContext(jid)) {
+        await sendCSVTo(jid);
+        upsertChatMessage(jid, true, '📄 Exportação CSV enviada.', Date.now());
+        return;
+      }
+
       const apptTs = parseAgendaConfirmation(body);
       if (apptTs) {
-        if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
+        if (c && c.ignoreNextFromMe) {
+          c.ignoreNextFromMe = false;
+          saveClients();
+        }
         scheduleAgenda(jid, apptTs);
         stopFollowUp(jid);
-        console.log('[AGENDA] Confirmação detectada na sua msg -> lembretes criados', jid);
+        console.log(
+          '[AGENDA] Confirmação detectada na sua msg -> lembretes criados',
+          jid
+        );
         return;
       }
 
-      // ignora eco do bot (funil enviado)
       if (c && c.ignoreNextFromMe) {
         c.ignoreNextFromMe = false;
         saveClients();
@@ -695,59 +3407,103 @@ function setupMessageHandler() {
         return;
       }
 
-      // log da sua mensagem (manual) no painel de conversas
       if (body && body.trim() && !body.trim().startsWith('#')) {
         upsertChatMessage(jid, true, body, Date.now());
       }
 
       if (!blocked[jid]) {
-        // Se o cliente tem agenda ativa, NÃO reinicia funil normal.
-        if (agendas[jid] && Array.isArray(agendas[jid]) && agendas[jid].length > 0) {
-          console.log('[MINHA MSG] Cliente com agenda ativa; não reinicia funil ->', jid);
+        const now = Date.now();
+
+        if (hasActiveAgenda(jid)) {
+          console.log(
+            '[MINHA MSG] Cliente com agenda ativa; não reinicia funil ->',
+            jid
+          );
+        } else if (c && c.isClient) {
+          console.log(
+            '[MINHA MSG] Cliente marcado como pós-venda; não reinicia funil normal ->',
+            jid
+          );
         } else {
-          console.log('[MINHA MSG] Reiniciando funil para', jid);
-          startFollowUp(jid);
+          if (paused[jid]) {
+            const pausedAt = paused[jid].pausedAt || paused[jid];
+            const PAUSE_MS = 72 * 60 * 60 * 1000;
+            const until = pausedAt + PAUSE_MS;
+
+            if (now < until) {
+              console.log(
+                '[PAUSE] Cliente em pausa até',
+                new Date(until).toISOString(),
+                '-> não reinicia funil',
+                jid
+              );
+              return;
+            } else {
+              delete paused[jid];
+              savePaused();
+              console.log(
+                '[PAUSE] Pausa expirada; próximo contato volta para funil ->',
+                jid
+              );
+            }
+          }
+
+          const prog = scheduledStarts[jid];
+          if (prog && prog.at && now < prog.at) {
+            console.log(
+              '[MINHA MSG] Cliente com mensagem programada futura; não reinicia funil ainda ->',
+              jid
+            );
+          } else {
+            console.log('[MINHA MSG] Reiniciando funil para', jid);
+            startFollowUp(jid);
+          }
         }
       }
       return;
     }
 
-    // --------- MSG DO CLIENTE ---------
     console.log('[CLIENTE]', jid, '->', body);
     upsertChatMessage(jid, false, body, Date.now());
 
-    // ❌ REMOVIDO auto-stop por palavras do cliente (para não sair por acidente)
-
     if (blocked[jid]) return;
 
-    // PAUSA de 72h: enquanto durar a janela, não reinicia funil nem entra em novos fluxos
     if (paused[jid]) {
       const pausedAt = paused[jid].pausedAt || paused[jid];
-      const PAUSE_MS = 72 * 60 * 60 * 1000; // 72 horas
+      const PAUSE_MS = 72 * 60 * 60 * 1000;
       const until = pausedAt + PAUSE_MS;
 
       if (Date.now() < until) {
-        console.log('[PAUSE] Cliente em pausa até', new Date(until).toISOString(), '-> não reinicia funil', jid);
+        console.log(
+          '[PAUSE] Cliente em pausa até',
+          new Date(until).toISOString(),
+          '-> não reinicia funil',
+          jid
+        );
         return;
       } else {
         delete paused[jid];
         savePaused();
-        console.log('[PAUSE] Pausa expirada, cliente volta ao funil ->', jid);
+        console.log(
+          '[PAUSE] Pausa expirada, cliente volta ao funil ->',
+          jid
+        );
       }
     }
 
     const c2 = clients[jid];
 
-    // Se for cliente pós-venda, não reinicia funil de pré-venda ao receber mensagem;
-    // apenas atualiza último contato e mantém o fluxo mensal.
     if (c2 && c2.isClient) {
       c2.lastContact = Date.now();
       saveClients();
-      console.log('[PÓS-VENDA] Mensagem recebida de cliente; mantém apenas fluxo mensal ->', jid);
+      console.log(
+        '[PÓS-VENDA] Mensagem recebida de cliente; mantém apenas fluxo mensal ->',
+        jid
+      );
       return;
     }
 
-    startFollowUp(jid);
+    // Cliente respondeu; apenas atualiza painel, sem reiniciar funil automaticamente.
   });
 }
 
@@ -765,8 +3521,8 @@ async function cleanupSocket() {
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  reconnectAttempts += 1;
-  const delay = Math.min(30000, 3000 * reconnectAttempts); // 3s, 6s, 9s ... até 30s
+  reconnectAttempts++;
+  const delay = Math.min(30000, 3000 * reconnectAttempts);
   reconnectTimer = setTimeout(async () => {
     reconnectTimer = null;
     await startBot();
@@ -777,33 +3533,37 @@ async function startBot() {
   try {
     await cleanupSocket();
 
-    const { state, saveCreds } = await useMultiFileAuthState('auth');
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     const { version } = await fetchLatestBaileysVersion();
+    const logger = pino({ level: 'info' });
 
     sock = makeWASocket({
       version,
+      printQRInTerminal: true,
       auth: state,
-      logger: P({ level: 'error' }),
+      logger,
+      browser: ['Ubuntu', 'Chrome', '22.04.4'],
+      syncFullHistory: false,
     });
-
-    console.log('✅ Bot inicializado. Aguardando QR para conexão...');
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async (update) => {
+    sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
         console.clear();
         console.log('📱 Escaneie este QR com o WhatsApp:');
         qrcode.generate(qr, { small: true });
-        console.log('\nNo celular: WhatsApp > Dispositivos conectados > Conectar um dispositivo.\n');
+        console.log(
+          '\nNo celular: WhatsApp > Dispositivos conectados > Conectar um dispositivo.\n'
+        );
       }
 
       if (connection === 'open') {
         isConnected = true;
         reconnectAttempts = 0;
-        console.log('✅ Conectado ao WhatsApp!');
+        console.log('✅ WhatsApp conectado!');
       } else if (connection === 'close') {
         isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -813,1969 +3573,19 @@ async function startBot() {
           console.log('🔁 Tentando reconectar...');
           scheduleReconnect();
         } else {
-          console.log('❌ Sessão encerrada. Apague a pasta "auth" para conectar novamente do zero.');
+          console.log(
+            '❌ Sessão encerrada. Apague a pasta "auth" para conectar novamente do zero.'
+          );
         }
       }
     });
 
     setupMessageHandler();
   } catch (err) {
-    console.error('Erro ao iniciar o bot:', err?.message || err);
+    console.error('Erro ao iniciar bot:', err);
     scheduleReconnect();
   }
 }
-
-// =================== PANEL WEB ===================
-
-const app = express();
-const server = http.createServer(app);
-let io = new Server(server, { cors: { origin: '*'} });
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-
-// socket.io - conversas em tempo real
-io.on('connection', (socket) => {
-  try {
-    socket.emit('init', { chats: listChats(), quickReplies: messagesConfig.quickReplies || [] });
-  } catch (e) {}
-
-  socket.on('get_chats', () => {
-    socket.emit('chats', listChats());
-  });
-
-  socket.on('open_chat', (jid) => {
-    if (!jid) return;
-    const c = ensureChat(jid);
-    c.unread = 0;
-    saveChats();
-    socket.emit('chat_history', { jid, messages: c.messages || [] });
-    io.emit('chat_update', {
-      jid: c.jid,
-      phone: c.phone,
-      updatedAt: c.updatedAt || Date.now(),
-      unread: 0,
-      pinnedAt: c.pinnedAt || 0,
-      pinned: !!(c.pinnedAt),
-      lastText: (c.messages && c.messages.length) ? c.messages[c.messages.length-1].text : '',
-      lastFromMe: (c.messages && c.messages.length) ? !!c.messages[c.messages.length-1].fromMe : false,
-      lastTs: (c.messages && c.messages.length) ? c.messages[c.messages.length-1].ts : (c.updatedAt || 0),
-    });
-  });
-
-  socket.on('toggle_pin', (jid) => {
-    try {
-      if (!jid) return;
-      const c = ensureChat(jid);
-      c.pinnedAt = c.pinnedAt ? 0 : Date.now();
-      saveChats();
-      // Atualiza todos os painéis conectados
-      io.emit('chat_update', {
-        jid: c.jid,
-        phone: c.phone,
-        updatedAt: c.updatedAt || Date.now(),
-        unread: c.unread || 0,
-        pinnedAt: c.pinnedAt || 0,
-        pinned: !!(c.pinnedAt),
-        lastText: (c.messages && c.messages.length) ? c.messages[c.messages.length-1].text : '',
-        lastFromMe: (c.messages && c.messages.length) ? !!c.messages[c.messages.length-1].fromMe : false,
-        lastTs: (c.messages && c.messages.length) ? c.messages[c.messages.length-1].ts : (c.updatedAt || 0),
-      });
-      io.emit('chats', listChats());
-    } catch (e) {}
-  });
-
-  socket.on('send_message', async (payload) => {
-    try {
-      const jid = payload?.jid;
-      const text = (payload?.text || '').toString().trim();
-      if (!jid || !text) return;
-      await sendText(jid, text);
-      socket.emit('send_ok', { jid });
-    } catch (e) {
-      socket.emit('send_err', { message: e?.message || 'Erro ao enviar' });
-    }
-  });
-
-  socket.on('get_quick_replies', () => {
-    socket.emit('quick_replies', messagesConfig.quickReplies || []);
-  });
-});
-
-
-function htmlEscape(str) {
-  if (!str) return '';
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-// =================== CHAT (CONVERSAS) ===================
-
-function phoneFromJid(jid) {
-  if (!jid) return '';
-  return String(jid).replace('@s.whatsapp.net','').replace('@lid','');
-}
-
-function ensureChat(jid) {
-  if (!chatStore[jid]) {
-    chatStore[jid] = {
-      jid,
-      phone: phoneFromJid(jid),
-      updatedAt: Date.now(),
-      unread: 0,
-      pinnedAt: 0,
-      messages: [],
-    };
-  }
-  if (!Array.isArray(chatStore[jid].messages)) chatStore[jid].messages = [];
-  return chatStore[jid];
-}
-
-function trimMessages(arr, max = 200) {
-  if (!Array.isArray(arr)) return [];
-  if (arr.length <= max) return arr;
-  return arr.slice(arr.length - max);
-}
-
-function upsertChatMessage(jid, fromMe, text, ts) {
-  if (!jid || !text) return;
-  const c = ensureChat(jid);
-  const msg = {
-    id: String(ts || Date.now()) + '_' + Math.random().toString(16).slice(2),
-    fromMe: !!fromMe,
-    text: String(text),
-    ts: ts || Date.now(),
-  };
-  c.messages.push(msg);
-  c.messages = trimMessages(c.messages);
-  c.updatedAt = msg.ts;
-  if (!fromMe) c.unread = (c.unread || 0) + 1;
-  saveChats();
-  if (io) {
-    io.emit('chat_update', {
-      jid: c.jid,
-      phone: c.phone,
-      updatedAt: c.updatedAt,
-      unread: c.unread || 0,
-      pinnedAt: c.pinnedAt || 0,
-      pinned: !!(c.pinnedAt),
-      lastText: msg.text,
-      lastFromMe: msg.fromMe,
-      lastTs: msg.ts,
-    });
-    io.emit('chat_message', { jid: c.jid, message: msg });
-  }
-}
-
-function listChats() {
-  const items = Object.values(chatStore || {}).map(c => ({
-    jid: c.jid,
-    phone: c.phone || phoneFromJid(c.jid),
-    updatedAt: c.updatedAt || 0,
-    unread: c.unread || 0,
-    pinnedAt: c.pinnedAt || 0,
-    pinned: !!(c.pinnedAt),
-    lastText: (c.messages && c.messages.length) ? c.messages[c.messages.length-1].text : '',
-    lastFromMe: (c.messages && c.messages.length) ? !!c.messages[c.messages.length-1].fromMe : false,
-    lastTs: (c.messages && c.messages.length) ? c.messages[c.messages.length-1].ts : (c.updatedAt || 0),
-  }));
-  // Pinned primeiro (mais recente em cima), depois por última atividade
-  items.sort((a,b) => {
-    const ap = a.pinnedAt || 0;
-    const bp = b.pinnedAt || 0;
-    if (ap && !bp) return -1;
-    if (!ap && bp) return 1;
-    if (bp !== ap) return bp - ap;
-    return (b.updatedAt||0) - (a.updatedAt||0);
-  });
-  return items;
-}
-
-async function sendText(jid, text) {
-  if (!sock || !isConnected) throw new Error('WhatsApp desconectado');
-  if (!jid || !text) return;
-  // DRY_RUN: não envia nada para ninguém (modo seguro de testes)
-  if (DRY_RUN) {
-    console.log(`[DRY_RUN] (não enviado) -> ${jid}: ${String(text).slice(0,120)}`);
-    // Opcional: registra no painel como 'simulado'
-    upsertChatMessage(jid, true, `[TESTE - NÃO ENVIADO]
-${text}`, Date.now());
-    return;
-  }
-  markBotSent(jid);
-  await sock.sendMessage(jid, { text });
-  upsertChatMessage(jid, true, text, Date.now());
-}
-
-
-
-function renderAgendasList() {
-  const items = [];
-  for (const [jid, arr] of Object.entries(agendas || {})) {
-    if (!Array.isArray(arr) || arr.length === 0) continue;
-    const sorted = [...arr].sort((a,b)=>a.at-b.at);
-    const next = sorted[0];
-    const dt = new Date(next.at);
-    const phone = jid.replace('@s.whatsapp.net','').replace(/^55/,'');
-    items.push({
-      jid,
-      phoneDisplay: phone,
-      nextAt: dt,
-      count: arr.length,
-      keys: sorted.map(x=>x.key).join(', ')
-    });
-  }
-  items.sort((a,b)=>a.nextAt - b.nextAt);
-
-  if (items.length === 0) {
-    return `<div class="empty">Nenhuma agenda confirmada ainda.</div>`;
-  }
-
-  const rows = items.map(it => {
-    const d = it.nextAt;
-    const dd = String(d.getDate()).padStart(2,'0');
-    const mm = String(d.getMonth()+1).padStart(2,'0');
-    const yyyy = d.getFullYear();
-    const hh = String(d.getHours()).padStart(2,'0');
-    const min = String(d.getMinutes()).padStart(2,'0');
-
-    return `
-      <tr>
-        <td>${htmlEscape(it.phoneDisplay)}</td>
-        <td>${dd}/${mm}/${yyyy} ${hh}:${min}</td>
-        <td>${it.count}</td>
-        <td><code>${htmlEscape(it.keys)}</code></td>
-        <td>
-          <button class="btn-danger"
-                  type="submit"
-                  formaction="/admin/agenda/delete"
-                  formmethod="POST"
-                  name="jid"
-                  value="${htmlEscape(it.jid)}"
-                  formnovalidate>
-            Cancelar agenda
-          </button>
-        </td>
-      </tr>`;
-  }).join('');
-
-  return `
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Contato</th>
-            <th>Próximo lembrete</th>
-            <th># lembretes</th>
-            <th>Tipos</th>
-            <th>Ações</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>`;
-}
-
-
-function renderProgramList() {
-  const items = [];
-  for (const [jid, s] of Object.entries(scheduledStarts || {})) {
-    if (!s || !s.at) continue;
-    const dt = new Date(s.at);
-    const phone = jid.replace('@s.whatsapp.net','').replace(/^55/,'');
-    items.push({
-      jid,
-      phoneDisplay: phone,
-      at: dt,
-      preview: (s.text || '').slice(0, 80),
-    });
-  }
-
-  items.sort((a,b)=>a.at - b.at);
-
-  if (items.length === 0) {
-    return `<div class="empty">Nenhuma mensagem programada.</div>`;
-  }
-
-  const rows = items.map(it => {
-    const d = it.at;
-    const dd = String(d.getDate()).padStart(2,'0');
-    const mm = String(d.getMonth()+1).padStart(2,'0');
-    const yyyy = d.getFullYear();
-    const hh = String(d.getHours()).padStart(2,'0');
-    const min = String(d.getMinutes()).padStart(2,'0');
-
-    return `
-      <tr>
-        <td>${htmlEscape(it.phoneDisplay)}</td>
-        <td>${dd}/${mm}/${yyyy} ${hh}:${min}</td>
-        <td><code>${htmlEscape(it.preview)}</code></td>
-        <td>
-          <button class="btn-danger"
-                  type="submit"
-                  formaction="/admin/program/delete"
-                  formmethod="POST"
-                  name="jid"
-                  value="${htmlEscape(it.jid)}"
-                  formnovalidate>
-            Cancelar
-          </button>
-        </td>
-      </tr>`;
-  }).join('');
-
-  return `
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Contato</th>
-            <th>Envio</th>
-            <th>Prévia</th>
-            <th>Ações</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>`;
-}
-
-
-app.get('/admin/chat', (req, res) => {
-  const html = `
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Painel Iron Glass - Conversas</title>
-  <style>
-    :root{
-      --bg0:#050816; --bg1:#0b1026;
-      --panel:rgba(15,23,42,.55);
-      --border:rgba(148,163,184,.18);
-      --text:#e5e7eb; --muted:#94a3b8;
-      --accent:#facc15; --accent2:#60a5fa;
-      --radius:18px; --blur:14px;
-      --shadow: 0 24px 80px rgba(0,0,0,.45);
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    }
-    *{box-sizing:border-box}
-    body{
-      margin:0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
-      color:var(--text);
-      background:
-        radial-gradient(1200px 800px at 15% 10%, rgba(250,204,21,.18), transparent 60%),
-        radial-gradient(900px 700px at 85% 20%, rgba(96,165,250,.16), transparent 55%),
-        linear-gradient(180deg, var(--bg0), var(--bg1));
-      min-height:100vh;
-    }
-    body.light{
-      --bg0:#f6f7fb; --bg1:#eef2ff;
-      --panel:rgba(255,255,255,.75);
-      --border:rgba(15,23,42,.12);
-      --text:#0b1220; --muted:#475569;
-      --shadow: 0 24px 70px rgba(2,6,23,.18);
-    }
-    a{color:inherit;text-decoration:none}
-    .top{
-      position:sticky;top:0;z-index:50;
-      display:flex;align-items:center;gap:12px;
-      padding:14px 16px;
-      border-bottom:1px solid var(--border);
-      background: rgba(2,6,23,.35);
-      backdrop-filter: blur(var(--blur));
-    }
-    body.light .top{background: rgba(255,255,255,.65)}
-    .logo{
-      width:40px;height:40px;border-radius:14px;
-      display:grid;place-items:center;
-      font-weight:900;letter-spacing:.5px;
-      background: linear-gradient(135deg, rgba(250,204,21,.25), rgba(96,165,250,.16));
-      border:1px solid rgba(250,204,21,.25);
-    }
-    .pill{
-      font-size:.78rem;color:var(--muted);
-      border:1px solid rgba(148,163,184,.16);
-      background: rgba(15,23,42,.22);
-      padding:7px 10px;border-radius:999px;
-      white-space:nowrap;
-    }
-    body.light .pill{background: rgba(255,255,255,.55)}
-    .pill.dry{color:#fde68a;border-color:rgba(250,204,21,.30);background: rgba(250,204,21,.10)}
-    .btn{
-      display:inline-flex;align-items:center;justify-content:center;gap:8px;
-      padding:10px 12px;border-radius:14px;
-      border:1px solid rgba(148,163,184,.18);
-      background: rgba(15,23,42,.40);
-      cursor:pointer;
-      font-weight:900;
-      transition: transform .12s ease, background .12s ease, border-color .12s ease;
-      color:inherit;
-    }
-    .btn:hover{transform:translateY(-1px);background: rgba(15,23,42,.62);border-color:rgba(250,204,21,.22)}
-    body.light .btn{background: rgba(255,255,255,.60)}
-    .btn.ghost{background: transparent; color: var(--muted);}
-    .btn.ghost:hover{color:var(--text)}
-    .btn.primary{background: linear-gradient(135deg, rgba(250,204,21,.22), rgba(96,165,250,.12));border-color: rgba(250,204,21,.28)}
-    .wrap{
-      padding:16px;
-      display:grid;
-      grid-template-columns: 360px 1fr 320px;
-      gap:14px;
-      align-items:start;
-    }
-    @media (max-width: 1100px){
-      .wrap{grid-template-columns: 1fr; }
-      #quickCol{order:3}
-    }
-    .col{min-width:0}
-    .list,.pane,.quick{
-      background: var(--panel);
-      border:1px solid rgba(148,163,184,.16);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(var(--blur));
-      overflow:hidden;
-    }
-    .search{padding:12px;border-bottom:1px solid rgba(148,163,184,.14)}
-    .search input{
-      width:100%;padding:10px 12px;border-radius:14px;
-      border:1px solid rgba(148,163,184,.18);
-      background: rgba(2,6,23,.35);
-      color:inherit;outline:none;
-    }
-    body.light .search input{background: rgba(255,255,255,.55)}
-    .items{max-height: calc(100vh - 220px); overflow:auto}
-    .item{
-      padding:12px 12px;
-      border-bottom:1px solid rgba(148,163,184,.10);
-      cursor:pointer;
-      display:flex;gap:10px;align-items:flex-start;
-    }
-    .item:hover{background: rgba(2,6,23,.20)}
-    body.light .item:hover{background: rgba(2,6,23,.06)}
-    .item.active{background: linear-gradient(135deg, rgba(250,204,21,.16), rgba(96,165,250,.10))}
-    .avatar{
-      width:34px;height:34px;border-radius:12px;
-      display:grid;place-items:center;
-      border:1px solid rgba(148,163,184,.18);
-      background: rgba(2,6,23,.30);
-      color: var(--muted);
-      font-weight:900;
-      flex:0 0 auto;
-    }
-    .meta{min-width:0}
-    .titleLine{display:flex;gap:8px;align-items:center}
-    .name{font-weight:900}
-    .sub{color:var(--muted);font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-    .paneTop{
-      padding:14px 14px 10px;
-      border-bottom:1px solid rgba(148,163,184,.14);
-      display:flex;gap:10px;align-items:flex-start;
-    }
-    .paneTop .title{font-weight:950}
-    .msgs{padding:12px;max-height: calc(100vh - 290px); overflow:auto; display:flex; flex-direction:column; gap:10px}
-    .bubble{
-      max-width: 82%;
-      border-radius: 16px;
-      padding:10px 12px;
-      border:1px solid rgba(148,163,184,.14);
-      background: rgba(2,6,23,.28);
-    }
-    body.light .bubble{background: rgba(255,255,255,.60)}
-    .bubble.me{
-      margin-left:auto;
-      background: linear-gradient(135deg, rgba(250,204,21,.18), rgba(96,165,250,.12));
-      border-color: rgba(250,204,21,.22);
-    }
-    .bubble .t{white-space:pre-wrap}
-    .bubble .s{margin-top:6px;color:var(--muted);font-size:.75rem}
-    .composer{
-      padding:12px;border-top:1px solid rgba(148,163,184,.14);
-      display:flex;gap:10px;align-items:flex-end;
-    }
-    .composer textarea{
-      flex:1;
-      min-height:44px;max-height:140px;
-      padding:10px 12px;border-radius:14px;
-      border:1px solid rgba(148,163,184,.18);
-      background: rgba(2,6,23,.35);
-      color:inherit;outline:none;resize:none;
-    }
-    body.light .composer textarea{background: rgba(255,255,255,.55)}
-    .composer button{flex:0 0 auto}
-    .quickHeader{
-      padding:14px 14px 10px;
-      border-bottom:1px solid rgba(148,163,184,.14);
-      display:flex;justify-content:space-between;align-items:flex-end;gap:10px;
-    }
-    .chips{padding:12px;display:grid;grid-template-columns:1fr;gap:10px;max-height: calc(100vh - 220px); overflow:auto}
-    .chip{
-      border:1px solid rgba(148,163,184,.16);
-      background: rgba(2,6,23,.22);
-      border-radius: 16px;
-      padding:10px 12px;
-      cursor:pointer;
-      transition: transform .12s ease, border-color .12s ease, background .12s ease;
-    }
-    body.light .chip{background: rgba(255,255,255,.55)}
-    .chip:hover{transform:translateY(-1px);border-color:rgba(250,204,21,.22);background: rgba(2,6,23,.26)}
-    body.light .chip:hover{background: rgba(255,255,255,.75)}
-    .chip .k{font-weight:950}
-    .chip .v{color:var(--muted);font-size:.82rem;margin-top:4px;white-space:pre-wrap}
-  </style>
-</head>
-<body>
-  <div class="top">
-    <div class="logo">IG</div>
-    <div style="display:flex;flex-direction:column;gap:2px;">
-      <div style="font-weight:950;line-height:1;">Chat ao vivo</div>
-      <div style="color:var(--muted);font-size:.82rem;">Conversas em tempo real • respostas rápidas • ancorados</div>
-    </div>
-    <div style="flex:1"></div>
-    ${DRY_RUN ? '<span class="pill dry">DRY_RUN (não envia)</span>' : '<span class="pill">LIVE</span>'}
-    <button class="btn ghost" id="themeBtn" title="Alternar tema">☾</button>
-    <a class="btn" href="/admin/quick">⚡ Quick</a>
-    <a class="btn" href="/admin">← Painel</a>
-  </div>
-
-  <div class="wrap">
-    <div class="col">
-      <div class="list">
-        <div class="search">
-          <input id="search" placeholder="Buscar por número..." />
-        </div>
-        <div id="chatList" class="items"></div>
-      </div>
-    </div>
-
-    <div class="col">
-      <div class="chat">
-        <div class="chatHeader">
-          <div class="title" id="chatTitle">Selecione uma conversa</div>
-          <div class="time" id="chatSub"></div>
-        </div>
-        <div id="msgs" class="msgs"></div>
-        <div class="composer">
-          <textarea id="text" placeholder="Escreva uma mensagem..."></textarea>
-          <button id="sendBtn" disabled>Enviar</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="col" id="quickCol">
-      <div class="quick">
-        <div class="quickHeader">
-          <div style="font-weight:900">Respostas rápidas</div>
-          <div style="color:#9ca3af;font-size:.82rem">Clique para enviar na conversa aberta.</div>
-        </div>
-        <div id="quickBtns" class="quickBtns"></div>
-      </div>
-    </div>
-  </div>
-
-  <div id="toast" class="toast"></div>
-
-  <script src="/socket.io/socket.io.js"></script>
-  <script>
-    const socket = io();
-    let chats = [];
-    let currentJid = null;
-
-    const elList = document.getElementById('chatList');
-    const elMsgs = document.getElementById('msgs');
-    const elTitle = document.getElementById('chatTitle');
-    const elSub = document.getElementById('chatSub');
-    const elSearch = document.getElementById('search');
-    const elText = document.getElementById('text');
-    const elSend = document.getElementById('sendBtn');
-    const elQuick = document.getElementById('quickBtns');
-    const elToast = document.getElementById('toast');
-
-    function fmtTime(ts){
-      try{
-        const d = new Date(ts);
-        const dd = String(d.getDate()).padStart(2,'0');
-        const mm = String(d.getMonth()+1).padStart(2,'0');
-        const hh = String(d.getHours()).padStart(2,'0');
-        const mi = String(d.getMinutes()).padStart(2,'0');
-        return dd+'/'+mm+' '+hh+':'+mi;
-      }catch(e){ return ''; }
-    }
-
-    function sortChats(){
-      chats.sort((a,b) => {
-        const ap = a.pinnedAt || 0;
-        const bp = b.pinnedAt || 0;
-        if (ap && !bp) return -1;
-        if (!ap && bp) return 1;
-        if (bp !== ap) return bp - ap;
-        return (b.updatedAt||0) - (a.updatedAt||0);
-      });
-    }
-
-    function toast(msg){
-      elToast.textContent = msg;
-      elToast.style.display = 'block';
-      clearTimeout(window.__t);
-      window.__t = setTimeout(()=> elToast.style.display='none', 2800);
-    }
-
-    function renderList(filter=''){
-      const f = (filter||'').trim();
-      elList.innerHTML = '';
-      chats
-        .filter(c => !f || (c.phone||'').includes(f))
-        .forEach(c => {
-          const div = document.createElement('div');
-          div.className = 'item' + (c.jid === currentJid ? ' active' : '');
-          div.onclick = () => openChat(c.jid);
-
-          const row = document.createElement('div');
-          row.className = 'row';
-
-          const left = document.createElement('div');
-          left.className = 'phone';
-          left.textContent = (c.pinnedAt ? '📌 ' : '') + (c.phone || c.jid);
-
-          const right = document.createElement('div');
-          right.style.display = 'flex';
-          right.style.gap = '8px';
-          right.style.alignItems = 'center';
-
-          const time = document.createElement('div');
-          time.className = 'time';
-          time.textContent = fmtTime(c.updatedAt || c.lastTs);
-
-          const pin = document.createElement('button');
-          pin.className = 'pinbtn' + (c.pinnedAt ? ' on' : '');
-          pin.textContent = '📌';
-          pin.title = c.pinnedAt ? 'Desafixar' : 'Fixar';
-          pin.onclick = (ev) => {
-            ev.preventDefault();
-            ev.stopPropagation();
-            socket.emit('toggle_pin', c.jid);
-          };
-
-          right.appendChild(time);
-          right.appendChild(pin);
-
-          row.appendChild(left);
-          row.appendChild(right);
-
-          if (c.unread && c.unread > 0){
-            const b = document.createElement('span');
-            b.className = 'badge';
-            b.textContent = c.unread;
-            row.appendChild(b);
-          }
-
-          const snip = document.createElement('div');
-          snip.className = 'snippet';
-          snip.textContent = c.lastText || '';
-
-          div.appendChild(row);
-          div.appendChild(snip);
-          elList.appendChild(div);
-        });
-    }
-
-    function renderQuick(items){
-      elQuick.innerHTML = '';
-      (items||[]).forEach(q => {
-        const b = document.createElement('button');
-        b.className = 'qbtn';
-        b.textContent = q.label || 'Resposta';
-        b.onclick = () => {
-          if (!currentJid) return toast('Selecione uma conversa primeiro');
-          socket.emit('send_message', { jid: currentJid, text: q.text || '' });
-        };
-        elQuick.appendChild(b);
-      });
-
-      if (!items || items.length === 0){
-        const p = document.createElement('div');
-        p.style.color = '#9ca3af';
-        p.style.fontSize = '.85rem';
-        p.textContent = 'Nenhuma resposta rápida configurada.';
-        elQuick.appendChild(p);
-      }
-    }
-
-    function appendMsg(m){
-      const wrap = document.createElement('div');
-      const bubble = document.createElement('div');
-      bubble.className = 'bubble ' + (m.fromMe ? 'me' : 'them');
-      bubble.textContent = m.text || '';
-      const meta = document.createElement('div');
-      meta.className = 'meta';
-      meta.textContent = fmtTime(m.ts);
-
-      wrap.appendChild(bubble);
-      wrap.appendChild(meta);
-      elMsgs.appendChild(wrap);
-      elMsgs.scrollTop = elMsgs.scrollHeight;
-    }
-
-    function openChat(jid){
-      currentJid = jid;
-      elMsgs.innerHTML = '';
-      elTitle.textContent = 'Carregando...';
-      elSub.textContent = '';
-      elSend.disabled = true;
-      socket.emit('open_chat', jid);
-      renderList(elSearch.value);
-    }
-
-    elSearch.addEventListener('input', () => renderList(elSearch.value));
-
-    elText.addEventListener('input', () => {
-      elSend.disabled = !currentJid || !(elText.value||'').trim();
-    });
-
-    elSend.addEventListener('click', () => {
-      const t = (elText.value||'').trim();
-      if (!currentJid || !t) return;
-      socket.emit('send_message', { jid: currentJid, text: t });
-      elText.value = '';
-      elSend.disabled = true;
-    });
-
-    socket.on('init', (data) => {
-      chats = data.chats || [];
-      sortChats();
-      renderList();
-      renderQuick(data.quickReplies || []);
-    });
-
-    socket.on('chats', (items) => {
-      chats = items || [];
-      sortChats();
-      renderList(elSearch.value);
-    });
-
-    socket.on('chat_update', (chat) => {
-      if (!chat || !chat.jid) return;
-      const i = chats.findIndex(c => c.jid === chat.jid);
-      if (i >= 0) chats[i] = Object.assign(chats[i], chat);
-      else chats.unshift(chat);
-      sortChats();
-      renderList(elSearch.value);
-    });
-
-    socket.on('chat_history', (data) => {
-      if (!data || !data.jid) return;
-      currentJid = data.jid;
-      elTitle.textContent = (data.jid || '').replace('@s.whatsapp.net','');
-      elSub.textContent = 'JID: ' + data.jid;
-      (data.messages || []).forEach(appendMsg);
-      elSend.disabled = !(elText.value||'').trim();
-    });
-
-    socket.on('chat_message', (payload) => {
-      if (!payload || payload.jid !== currentJid) return;
-      appendMsg(payload.message || {});
-    });
-
-    socket.on('send_ok', () => toast('Mensagem enviada ✅'));
-    socket.on('send_err', (e) => toast((e && e.message) ? e.message : 'Erro ao enviar'));
-  </script>
-
-  <script>
-    (() => {
-      const key = 'ig_theme';
-      const apply = (v) => document.body.classList.toggle('light', v === 'light');
-      apply(localStorage.getItem(key) || 'dark');
-      const btn = document.getElementById('themeBtn');
-      if(btn){
-        btn.addEventListener('click', () => {
-          const next = document.body.classList.contains('light') ? 'dark' : 'light';
-          localStorage.setItem(key, next);
-          apply(next);
-        });
-      }
-    })();
-  </script>
-
-</body>
-</html>
-`;
-  res.send(html);
-});
-
-
-app.get('/admin/quick', (req, res) => {
-  const items = Array.isArray(messagesConfig.quickReplies) ? messagesConfig.quickReplies : [];
-  const lines = items.map(it => {
-    const label = (it.label || '').replace(/\|/g,'-');
-    const text = (it.text || '').replace(/\r?\n/g,'\\n').replace(/\|/g,'-');
-    return label + '|' + text;
-  }).join('\n');
-
-  const html = `
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Respostas rápidas</title>
-  <style>
-
-    :root{
-      --bg:#060b1a;
-      --panel:rgba(17,24,39,.85);
-      --border:rgba(148,163,184,.18);
-      --text:#e5e7eb;
-      --muted:#94a3b8;
-      --accent:#facc15;
-      --blue:#60a5fa;
-      --r:18px;
-      --shadow: 0 18px 60px rgba(0,0,0,.35);
-    }
-    *{box-sizing:border-box}
-    body{
-      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
-      background:
-        radial-gradient(1200px 700px at 10% -10%, rgba(250,204,21,.16), transparent 55%),
-        radial-gradient(1000px 600px at 90% 0%, rgba(96,165,250,.16), transparent 55%),
-        var(--bg);
-      color:var(--text);
-      margin:0;
-      padding:22px 14px;
-    }
-    a{color:var(--blue);text-decoration:none}
-    a:hover{text-decoration:underline}
-    .card{
-      max-width: 980px;
-      margin: 0 auto;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: var(--r);
-      box-shadow: var(--shadow);
-      padding: 18px;
-      backdrop-filter: blur(10px);
-    }
-    h1{margin:0 0 6px 0;font-size:1.35rem}
-    .sub{color:var(--muted);margin:0 0 16px 0}
-    .topbar{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
-    .pill{
-      display:inline-flex;align-items:center;gap:8px;
-      padding:8px 12px;border-radius:999px;
-      background:rgba(2,6,23,.55);
-      border:1px solid var(--border);
-      font-weight:900;font-size:.9rem;
-    }
-    textarea, input{
-      width:100%;
-      border-radius:14px;
-      border:1px solid rgba(148,163,184,.22);
-      background:rgba(2,6,23,.55);
-      color:var(--text);
-      padding:10px 12px;
-      outline:none;
-    }
-    textarea{min-height:110px;resize:vertical}
-    textarea:focus, input:focus{
-      border-color: rgba(96,165,250,.55);
-      box-shadow: 0 0 0 4px rgba(96,165,250,.12);
-    }
-    .row{display:grid;grid-template-columns: 1fr auto;gap:12px;align-items:start;margin:10px 0}
-    .btn{
-      border:none;
-      padding:10px 14px;
-      border-radius:14px;
-      font-weight:900;
-      cursor:pointer;
-      background:linear-gradient(135deg, rgba(250,204,21,.22), rgba(96,165,250,.18));
-      color:var(--text);
-      border:1px solid rgba(250,204,21,.25);
-      transition: transform .08s ease, filter .12s ease;
-      white-space:nowrap;
-    }
-    .btn:hover{filter:brightness(1.05)}
-    .btn:active{transform: translateY(1px)}
-    .btn.secondary{
-      background:rgba(2,6,23,.55);
-      border:1px solid rgba(148,163,184,.22);
-      color:var(--text);
-    }
-    .table-wrap{
-      border:1px solid var(--border);
-      border-radius: 14px;
-      overflow:hidden;
-      margin-top:14px;
-      background: rgba(2,6,23,.35);
-    }
-    table{width:100%;border-collapse:separate;border-spacing:0}
-    th,td{padding:12px 12px;border-bottom:1px solid rgba(148,163,184,.12);text-align:left;vertical-align:top}
-    th{background:rgba(2,6,23,.55);position:sticky;top:0}
-    tr:hover td{background:rgba(2,6,23,.28)}
-    code{color:var(--accent)}
-    @media (max-width: 720px){
-      .row{grid-template-columns:1fr}
-    }
-
-  </style>
-</head>
-<body>
-  <div class="c">
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
-      <div style="font-weight:900;font-size:1.05rem">Respostas rápidas do painel de conversas</div>
-      <a href="/admin/chat">← Voltar</a>
-    </div>
-    <p class="hint">
-      Formato: <code>TÍTULO|TEXTO</code> (1 por linha). Para quebrar linha no texto, use <code>\n</code>.
-    </p>
-    <form method="POST" action="/admin/quick">
-      <textarea name="lines" placeholder="Ex:\nEnviar horários|Perfeito! Me diz manhã ou tarde?\nEndereço|Estamos na ...">${htmlEscape(lines)}</textarea>
-      <button type="submit">Salvar respostas rápidas</button>
-    </form>
-  </div>
-</body>
-</html>
-`;
-  res.send(html);
-});
-
-app.post('/admin/quick', (req, res) => {
-  try {
-    const raw = (req.body.lines || '').toString();
-    const rows = raw.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-    const items = [];
-    for (const row of rows) {
-      const parts = row.split('|');
-      const label = (parts[0] || '').trim();
-      const text = (parts.slice(1).join('|') || '').trim().replace(/\\n/g, '\n');
-      if (!label || !text) continue;
-      items.push({ label, text });
-    }
-    messagesConfig.quickReplies = items;
-    saveMessages();
-  } catch (e) {
-    console.error('[ERRO] salvar quick replies', e);
-  }
-  res.redirect('/admin/chat');
-});
-
-
-// =====================
-// Painel (versão organizada por abas)
-// =====================
-app.get('/admin', (req, res) => {
-  const tab = String(req.query.tab || 'funil').toLowerCase();
-  const m = messagesConfig;
-  const agendasList = renderAgendasList();
-  const programList = renderProgramList();
-
-  const nav = `
-    <div class="nav">
-      <a class="navbtn ${tab==='funil' ? 'active' : ''}" href="/admin?tab=funil">✅ Funil</a>
-      <a class="navbtn ${tab==='program' ? 'active' : ''}" href="/admin?tab=program">⏳ Programados</a>
-      <a class="navbtn ${tab==='agenda' ? 'active' : ''}" href="/admin?tab=agenda">📅 Agenda</a>
-      <a class="navbtn ${tab==='confirm' ? 'active' : ''}" href="/admin?tab=confirm">✅ Confirmação</a>
-      <a class="navbtn" href="/admin/chat">💬 Chat ao vivo</a>
-      <a class="navbtn" href="/admin/quick">⚡ Respostas rápidas</a>
-      <a class="navbtn" href="/admin/full">🧩 Painel completo</a>
-    </div>
-  `;
-
-  const baseStyles = `
-    <style>
-      :root{
-        --bg0:#050816;
-        --bg1:#0b1026;
-        --panel:rgba(15,23,42,.55);
-        --panel2:rgba(2,6,23,.55);
-        --border:rgba(148,163,184,.18);
-        --text:#e5e7eb;
-        --muted:#94a3b8;
-        --accent:#facc15;
-        --accent2:#60a5fa;
-        --ok:#34d399;
-        --danger:#fb7185;
-        --radius:20px;
-        --shadow: 0 24px 80px rgba(0,0,0,.45);
-        --blur: 14px;
-        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      }
-      *{box-sizing:border-box}
-      html,body{height:100%}
-      body{
-        margin:0;
-        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji","Segoe UI Emoji";
-        color:var(--text);
-        min-height:100vh;
-        background:
-          radial-gradient(1200px 800px at 15% 10%, rgba(250,204,21,.18), transparent 60%),
-          radial-gradient(900px 700px at 85% 20%, rgba(96,165,250,.16), transparent 55%),
-          linear-gradient(180deg, var(--bg0), var(--bg1));
-      }
-      body::before{
-        content:"";
-        position:fixed;
-        inset:0;
-        pointer-events:none;
-        background-image: radial-gradient(rgba(255,255,255,.8) 1px, transparent 1px);
-        background-size: 3px 3px;
-        opacity:.03;
-        mix-blend-mode: overlay;
-      }
-      a{color:inherit;text-decoration:none}
-      .appShell{display:flex;min-height:100vh}
-      .sidebar{
-        width:280px;
-        padding:18px;
-        background: rgba(2,6,23,.55);
-        border-right:1px solid var(--border);
-        backdrop-filter: blur(var(--blur));
-        position:sticky;
-        top:0;
-        height:100vh;
-      }
-      .brand{display:flex;align-items:center;gap:12px;padding:10px 10px 14px}
-      .logo{
-        width:40px;height:40px;border-radius:14px;
-        display:grid;place-items:center;
-        background: linear-gradient(135deg, rgba(250,204,21,.25), rgba(96,165,250,.16));
-        border:1px solid rgba(250,204,21,.25);
-        font-weight:900;letter-spacing:.5px;
-      }
-      .brandTitle{font-weight:900;line-height:1}
-      .brandSub{color:var(--muted);font-size:.82rem;margin-top:2px}
-      .nav{display:flex;flex-direction:column;gap:8px;margin-top:10px}
-      .navbtn{
-        display:flex;align-items:center;gap:10px;
-        padding:12px 12px;border-radius:14px;
-        border:1px solid rgba(148,163,184,.12);
-        background: rgba(15,23,42,.35);
-        transition: transform .12s ease, background .12s ease, border-color .12s ease;
-        font-weight:800;
-      }
-      .navbtn:hover{transform:translateY(-1px);background: rgba(15,23,42,.55);border-color: rgba(250,204,21,.22)}
-      .navbtn.active{
-        background: linear-gradient(135deg, rgba(250,204,21,.20), rgba(96,165,250,.10));
-        border-color: rgba(250,204,21,.28);
-      }
-      .sideFooter{margin-top:auto;padding:14px 10px 10px;color:var(--muted);font-size:.82rem;display:flex;flex-direction:column;gap:10px}
-      .main{flex:1;display:flex;flex-direction:column;min-width:0}
-      .topbar{
-        position:sticky;top:0;z-index:10;
-        display:flex;align-items:center;gap:12px;
-        padding:14px 18px;
-        border-bottom:1px solid var(--border);
-        background: rgba(2,6,23,.35);
-        backdrop-filter: blur(var(--blur));
-      }
-      .searchWrap{
-        flex:1;display:flex;align-items:center;gap:10px;
-        background: rgba(15,23,42,.35);
-        border:1px solid rgba(148,163,184,.14);
-        border-radius:16px;padding:10px 12px;
-        min-width:200px;
-      }
-      .searchIcon{opacity:.8;color:var(--muted);font-weight:900}
-      .searchWrap input{
-        width:100%;border:0;outline:0;background:transparent;color:var(--text);
-        font-size:.95rem;
-      }
-      .pills{display:flex;gap:8px;flex-wrap:wrap}
-      .pill{
-        font-size:.78rem;
-        color:var(--muted);
-        border:1px solid rgba(148,163,184,.16);
-        background: rgba(15,23,42,.25);
-        padding:7px 10px;border-radius:999px;
-        white-space:nowrap;
-      }
-      .pill.ok{color:#bbf7d0;border-color:rgba(16,185,129,.35);background: rgba(16,185,129,.10)}
-      .pill.dry{color:#fde68a;border-color:rgba(250,204,21,.30);background: rgba(250,204,21,.10)}
-      .actions{display:flex;gap:10px;align-items:center}
-      .btn{
-        display:inline-flex;align-items:center;justify-content:center;gap:8px;
-        padding:10px 12px;border-radius:14px;
-        border:1px solid rgba(148,163,184,.18);
-        background: rgba(15,23,42,.40);
-        color:var(--text);
-        cursor:pointer;
-        font-weight:900;
-        transition: transform .12s ease, background .12s ease, border-color .12s ease;
-      }
-      .btn:hover{transform:translateY(-1px);background: rgba(15,23,42,.62);border-color:rgba(250,204,21,.22)}
-      .btn.primary{
-        background: linear-gradient(135deg, rgba(250,204,21,.22), rgba(96,165,250,.12));
-        border-color: rgba(250,204,21,.28);
-      }
-      .btn.ghost{
-        background: transparent;
-        border-color: rgba(148,163,184,.16);
-        color: var(--muted);
-      }
-      .btn.ghost:hover{color:var(--text);border-color:rgba(250,204,21,.22)}
-      .contentWrap{padding:18px}
-      .container{max-width:1140px;margin:0 auto}
-      h1{margin:0;font-size:1.25rem}
-      h2{margin:0 0 10px 0;font-size:1.05rem}
-      .subtitle{color:var(--muted);margin:6px 0 14px 0}
-      .card{
-        background: var(--panel);
-        border:1px solid rgba(148,163,184,.16);
-        border-radius: var(--radius);
-        padding:16px;
-        box-shadow: var(--shadow);
-        backdrop-filter: blur(var(--blur));
-        overflow:hidden;
-      }
-      .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-      .input,.textarea,select{
-        width:100%;
-        padding:10px 12px;
-        border-radius:14px;
-        border:1px solid rgba(148,163,184,.18);
-        background: rgba(2,6,23,.35);
-        color:var(--text);
-        outline:none;
-      }
-      .textarea{min-height:100px;resize:vertical}
-      .muted{color:var(--muted);font-size:.9rem}
-      .sep{height:1px;background:rgba(148,163,184,.16);margin:14px 0}
-      table{width:100%;border-collapse:separate;border-spacing:0}
-      th,td{padding:12px 12px;border-bottom:1px solid rgba(148,163,184,.12);text-align:left;vertical-align:top}
-      th{
-        background:rgba(2,6,23,.55);
-        position:sticky;top:0;
-        font-size:.82rem;letter-spacing:.02em;text-transform:uppercase;
-        color: rgba(226,232,240,.9);
-      }
-      tr:hover td{background:rgba(2,6,23,.20)}
-      code{font-family:var(--mono);color:var(--accent)}
-      .toast{
-        position:fixed;right:16px;bottom:16px;
-        background: rgba(2,6,23,.72);
-        border:1px solid rgba(148,163,184,.18);
-        padding:12px 14px;border-radius:16px;
-        box-shadow: var(--shadow);
-        display:none;
-      }
-      .toast.show{display:block}
-
-      body.light{
-        --bg0:#f6f7fb;
-        --bg1:#eef2ff;
-        --panel:rgba(255,255,255,.75);
-        --panel2:rgba(255,255,255,.62);
-        --border:rgba(15,23,42,.12);
-        --text:#0b1220;
-        --muted:#475569;
-        --shadow: 0 24px 70px rgba(2,6,23,.18);
-      }
-      body.light::before{opacity:.02}
-      body.light .sidebar{background: rgba(255,255,255,.70)}
-      body.light .topbar{background: rgba(255,255,255,.60)}
-
-      @media (max-width: 980px){
-        .sidebar{position:fixed;left:-320px;transition:left .2s ease}
-        .sidebar.open{left:0}
-        .topbar{padding-left:12px}
-        .contentWrap{padding:14px}
-        .row{grid-template-columns:1fr}
-      }
-    </style>
-`;
-
-  let content = '';
-
-  if (tab === 'program') {
-    content = `
-      <div class="card" style="margin-bottom:14px;">
-        <h2>⏳ Programar primeira mensagem (início futuro)</h2>
-        <small>Útil quando o cliente diz “falo em fevereiro” etc. O funil fica pausado até essa data.</small>
-      </div>
-
-      <form method="POST" action="/admin/program">
-        <input type="hidden" name="returnTab" value="program" />
-        <div class="grid">
-          <div class="card">
-            <h2>Telefone</h2>
-            <label for="programPhone">Número (com DDD)</label>
-            <input id="programPhone" name="programPhone" placeholder="5511999999999" />
-          </div>
-
-          <div class="card">
-            <h2>Data / Hora</h2>
-            <label for="programDate">Data</label>
-            <input id="programDate" name="programDate" type="date" />
-            <label for="programTime">Hora</label>
-            <input id="programTime" name="programTime" type="time" value="09:00" />
-          </div>
-
-          <div class="card" style="grid-column:1/-1;">
-            <h2>Mensagem</h2>
-            <label for="programText">Texto</label>
-            <textarea id="programText" name="programText" placeholder="Olá! Combinado de falar na data..."></textarea>
-            <div style="margin-top:12px;">
-              <button type="submit">Programar mensagem</button>
-            </div>
-          </div>
-
-          <div class="card" style="grid-column:1/-1;">
-            <h2 style="margin:0 0 4px 0;">Mensagens programadas</h2>
-            <small class="muted">Clientes que vão receber o primeiro contato em uma data futura.</small>
-            <div style="margin-top:10px;">${programList}</div>
-          </div>
-        </div>
-      </form>
-    `;
-  } else if (tab === 'agenda') {
-    content = `
-      <div class="card" style="margin-bottom:14px;">
-        <h2>📅 Programação de agenda</h2>
-        <small>Programa lembretes de confirmação (7/3/1 dia antes). Pode (opcional) enviar a confirmação na hora.</small>
-      </div>
-
-      <form method="POST" action="/admin/agenda">
-        <input type="hidden" name="returnTab" value="agenda" />
-        <div class="grid">
-          <div class="card">
-            <h2>Cliente</h2>
-            <label for="phone">Telefone (com DDD)</label>
-            <input id="phone" name="phone" placeholder="5511999999999" />
-          </div>
-
-          <div class="card">
-            <h2>Data / Hora</h2>
-            <label for="date">Data</label>
-            <input id="date" name="date" type="date" />
-            <label for="time">Hora</label>
-            <input id="time" name="time" type="time" />
-          </div>
-
-          <div class="card" style="grid-column:1/-1;">
-            <h2>Dados do serviço</h2>
-            <small>Usados no template de confirmação: {{DATA}}, {{HORA}}, {{VEICULO}}, {{PRODUTO}}, {{VALOR}}, {{SINAL}}, {{PAGAMENTO}}</small>
-            <div class="grid" style="margin-top:8px;">
-              <div>
-                <label for="vehicle">Veículo</label>
-                <input id="vehicle" name="vehicle" placeholder="BYD Dolphin 2024" />
-              </div>
-              <div>
-                <label for="product">Produto</label>
-                <input id="product" name="product" placeholder="Iron Glass Plus" />
-              </div>
-              <div>
-                <label for="valor">Valor</label>
-                <input id="valor" name="valor" placeholder="R$ 12.900" />
-              </div>
-              <div>
-                <label for="sinal">Sinal</label>
-                <input id="sinal" name="sinal" placeholder="R$ 1.000" />
-              </div>
-              <div style="grid-column:1/-1;">
-                <label for="pagamento">Forma de pagamento</label>
-                <input id="pagamento" name="pagamento" placeholder="PIX confirmado" />
-              </div>
-            </div>
-
-            <label style="display:flex;align-items:center;gap:6px;margin-top:10px;">
-              <input type="checkbox" name="sendConfirm" />
-              Enviar mensagem de confirmação agora
-            </label>
-
-            <div style="margin-top:12px;">
-              <button type="submit">Programar lembretes</button>
-            </div>
-          </div>
-        </div>
-      </form>
-
-      <div class="footer">
-        <div class="badge"><span class="badge-dot"></span> Envio automático só entre ${START_HOUR}:00 e ${END_HOUR}:00</div>
-      </div>
-    `;
-  } else if (tab === 'confirm') {
-    content = `
-      <div class="card" style="margin-bottom:14px;">
-        <h2>✅ Confirmação de agenda</h2>
-        <small>Textos dos lembretes (7/3/1 dia antes) + template de confirmação.</small>
-      </div>
-
-      <form method="POST" action="/admin/mensajes">
-        <input type="hidden" name="returnTab" value="confirm" />
-        <div class="grid">
-          <div class="card">
-            <h2>7 dias antes</h2>
-            <label for="agenda0">Mensagem:</label>
-            <textarea id="agenda0" name="agenda0">${htmlEscape(m.agenda0 || '')}</textarea>
-          </div>
-
-          <div class="card">
-            <h2>3 dias antes</h2>
-            <label for="agenda1">Mensagem:</label>
-            <textarea id="agenda1" name="agenda1">${htmlEscape(m.agenda1 || '')}</textarea>
-          </div>
-
-          <div class="card">
-            <h2>1 dia antes</h2>
-            <label for="agenda2">Mensagem:</label>
-            <textarea id="agenda2" name="agenda2">${htmlEscape(m.agenda2 || '')}</textarea>
-          </div>
-
-          <div class="card" style="grid-column:1/-1;">
-            <h2>Template de confirmação</h2>
-            <small>Variáveis: {{DATA}}, {{HORA}}, {{VEICULO}}, {{PRODUTO}}, {{VALOR}}, {{SINAL}}, {{PAGAMENTO}}</small>
-            <label for="confirmTemplate">Mensagem:</label>
-            <textarea id="confirmTemplate" name="confirmTemplate">${htmlEscape(m.confirmTemplate || '')}</textarea>
-          </div>
-        </div>
-
-        <div class="footer">
-          <div class="badge"><span class="badge-dot"></span> Envio automático só entre ${START_HOUR}:00 e ${END_HOUR}:00</div>
-          <button type="submit">Salvar confirmação</button>
-        </div>
-      </form>
-
-      <hr />
-
-      <div class="card">
-        <h2>Agendas confirmadas</h2>
-        <small>Clientes com lembretes de confirmação ativos.</small>
-        <div style="margin-top:10px;">${agendasList}</div>
-      </div>
-    `;
-  } else { // funil (default)
-    content = `
-      <div class="card" style="margin-bottom:14px;">
-        <h2>✅ Funil automático</h2>
-        <small>Mensagens para 3, 5, 7, 15 dias + pós-venda.</small>
-      </div>
-
-      <form method="POST" action="/admin/mensajes">
-        <input type="hidden" name="returnTab" value="funil" />
-        <div class="grid">
-          <div class="card">
-            <h2>Etapa 1 • 3 dias</h2>
-            <label for="step0">Mensagem:</label>
-            <textarea id="step0" name="step0">${htmlEscape(m.step0)}</textarea>
-          </div>
-
-          <div class="card">
-            <h2>Etapa 2 • 5 dias</h2>
-            <label for="step1">Mensagem:</label>
-            <textarea id="step1" name="step1">${htmlEscape(m.step1)}</textarea>
-          </div>
-
-          <div class="card">
-            <h2>Etapa 3 • 7 dias</h2>
-            <label for="step2">Mensagem:</label>
-            <textarea id="step2" name="step2">${htmlEscape(m.step2)}</textarea>
-          </div>
-
-          <div class="card">
-            <h2>Etapa 4 • 15 dias</h2>
-            <label for="step3">Mensagem:</label>
-            <textarea id="step3" name="step3">${htmlEscape(m.step3)}</textarea>
-          </div>
-
-          <div class="card" style="grid-column:1/-1;">
-            <h2>Mensagens extras</h2>
-            <small>Opcional: mensagens extras / variações.</small>
-            <label for="extra">Extra:</label>
-            <textarea id="extra" name="extra">${htmlEscape(m.extra || '')}</textarea>
-          </div>
-
-          <div class="card" style="grid-column:1/-1;">
-            <h2>Pós-venda • a cada 30 dias</h2>
-            <label for="postSale30">Mensagem:</label>
-            <textarea id="postSale30" name="postSale30">${htmlEscape(m.postSale30 || '')}</textarea>
-          </div>
-        </div>
-
-        <div class="footer">
-          <div class="badge"><span class="badge-dot"></span> Envio automático só entre ${START_HOUR}:00 e ${END_HOUR}:00</div>
-          <button type="submit">Salvar funil</button>
-        </div>
-      </form>
-    `;
-  }
-
-  const html = `
-    <!DOCTYPE html>
-    <html lang="pt-br">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-      <title>Painel do Bot</title>
-      ${baseStyles}
-    </head>
-    <body>
-  <div class="appShell">
-    <aside class="sidebar" id="sidebar">
-      <div class="brand">
-        <div class="logo">IG</div>
-        <div>
-          <div class="brandTitle">Painel Iron Glass</div>
-          <div class="brandSub">Operação • Agenda • Funil • Chat</div>
-        </div>
-      </div>
-      ${nav}
-      <div class="sideFooter">
-        <div class="pill ${DRY_RUN ? 'dry' : 'ok'}">${DRY_RUN ? 'DRY_RUN ativo (não envia)' : 'Envio ativo'}</div>
-        <a class="btn ghost" style="justify-content:flex-start" href="/admin/chat">💬 Abrir Chat ao vivo</a>
-        <div>Dica: use a busca no topo para filtrar tabelas.</div>
-      </div>
-    </aside>
-
-    <main class="main">
-      <header class="topbar">
-        <button class="btn ghost" id="menuBtn" style="display:none">☰</button>
-
-        <div class="searchWrap">
-          <div class="searchIcon">⌕</div>
-          <input id="globalSearch" placeholder="Buscar no painel (número, chave, texto)..." />
-        </div>
-
-        <div class="pills">
-          <span class="pill ${DRY_RUN ? 'dry' : 'ok'}">${DRY_RUN ? 'DRY_RUN' : 'LIVE'}</span>
-          <span class="pill">Janela: 09:00–22:00</span>
-          <span class="pill">TZ: ${process.env.TZ || 'local'}</span>
-        </div>
-
-        <div class="actions">
-          <a class="btn primary" href="/admin/chat">Chat ao vivo</a>
-          <button class="btn ghost" id="themeBtn" title="Alternar tema">☾</button>
-        </div>
-      </header>
-
-      <div class="contentWrap">
-        <div class="container">
-          ${content}
-        </div>
-      </div>
-    </main>
-  </div>
-
-  <div class="toast" id="toast"></div>
-
-  <script>
-    (() => {
-      // Mobile sidebar
-      const sidebar = document.getElementById('sidebar');
-      const menuBtn = document.getElementById('menuBtn');
-      const mq = window.matchMedia('(max-width: 980px)');
-
-      function updateMenu(){
-        menuBtn.style.display = mq.matches ? 'inline-flex' : 'none';
-        if(!mq.matches) sidebar.classList.remove('open');
-      }
-      if(mq.addEventListener) mq.addEventListener('change', updateMenu);
-      window.addEventListener('resize', updateMenu);
-      updateMenu();
-
-      menuBtn.addEventListener('click', () => sidebar.classList.toggle('open'));
-
-      // Theme toggle
-      const key = 'ig_theme';
-      const apply = (v) => document.body.classList.toggle('light', v === 'light');
-      apply(localStorage.getItem(key) || 'dark');
-
-      document.getElementById('themeBtn').addEventListener('click', () => {
-        const next = document.body.classList.contains('light') ? 'dark' : 'light';
-        localStorage.setItem(key, next);
-        apply(next);
-      });
-
-      // Global search (filters tables + soft-dims other cards)
-      const input = document.getElementById('globalSearch');
-      const norm = (s) => String(s || '').toLowerCase();
-
-      function filter(){
-        const q = norm(input.value.trim());
-        document.querySelectorAll('table tbody tr').forEach(tr => {
-          const hit = !q || norm(tr.innerText).includes(q);
-          tr.style.display = hit ? '' : 'none';
-        });
-        document.querySelectorAll('.card').forEach(card => {
-          if(!q){ card.style.opacity=''; return; }
-          card.style.opacity = norm(card.innerText).includes(q) ? '' : '0.35';
-        });
-      }
-      input.addEventListener('input', filter);
-    })();
-  </script>
-</body>
-    </html>
-  `;
-  res.send(html);
-});
-
-app.get('/admin/full', (req, res) => {
-  const m = messagesConfig;
-  const agendasList = renderAgendasList();
-  const programList = renderProgramList();
-
-  const html = `
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-  <meta charset="UTF-8" />
-  <title>Painel Iron Glass - Bot</title>
-  <style>
-
-    :root{
-      --bg:#060b1a;
-      --panel:rgba(17,24,39,.85);
-      --card:rgba(2,6,23,.45);
-      --border:rgba(148,163,184,.18);
-      --text:#e5e7eb;
-      --muted:#94a3b8;
-      --accent:#facc15;
-      --blue:#60a5fa;
-      --r:18px;
-      --shadow: 0 18px 60px rgba(0,0,0,.35);
-    }
-    *{box-sizing:border-box}
-    body{
-      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial;
-      background:
-        radial-gradient(1200px 700px at 10% -10%, rgba(250,204,21,.16), transparent 55%),
-        radial-gradient(1000px 600px at 90% 0%, rgba(96,165,250,.16), transparent 55%),
-        var(--bg);
-      color:var(--text);
-      margin:0;
-      padding:22px 14px;
-    }
-    a{color:var(--blue);text-decoration:none}
-    a:hover{text-decoration:underline}
-    .container{
-      max-width: 1120px;
-      margin: 0 auto;
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: var(--r);
-      box-shadow: var(--shadow);
-      padding: 18px;
-      backdrop-filter: blur(10px);
-    }
-    h1{margin:0 0 6px 0;font-size:1.45rem;display:flex;align-items:center;gap:10px}
-    .logo{
-      display:inline-flex;align-items:center;justify-content:center;
-      width:36px;height:36px;border-radius:14px;
-      background:linear-gradient(135deg, rgba(250,204,21,.18), rgba(96,165,250,.14));
-      border:1px solid rgba(250,204,21,.35);
-      font-weight:900;font-size:.8rem;color:var(--accent);
-      letter-spacing:.5px;
-    }
-    .subtitle{color:var(--muted);font-size:.92rem;margin-bottom:14px}
-    .grid{display:grid;grid-template-columns:1fr;gap:14px}
-    .card{
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 16px;
-    }
-    h2{margin:0 0 10px 0;font-size:1.06rem}
-    input, textarea, select{
-      width:100%;
-      border-radius:14px;
-      border:1px solid rgba(148,163,184,.22);
-      background:rgba(2,6,23,.55);
-      color:var(--text);
-      padding:10px 12px;
-      outline:none;
-    }
-    textarea{min-height:98px;resize:vertical}
-    input:focus, textarea:focus, select:focus{
-      border-color: rgba(96,165,250,.55);
-      box-shadow: 0 0 0 4px rgba(96,165,250,.12);
-    }
-    .row{display:grid;grid-template-columns: 1fr 1fr; gap:12px;align-items:end}
-    .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
-    .btn{
-      border:none;
-      padding:10px 14px;
-      border-radius:14px;
-      font-weight:900;
-      cursor:pointer;
-      background:linear-gradient(135deg, rgba(250,204,21,.22), rgba(96,165,250,.18));
-      color:var(--text);
-      border:1px solid rgba(250,204,21,.25);
-      transition: transform .08s ease, filter .12s ease;
-    }
-    .btn:hover{filter:brightness(1.05)}
-    .btn:active{transform: translateY(1px)}
-    .btn.secondary{
-      background:rgba(2,6,23,.55);
-      border:1px solid rgba(148,163,184,.22);
-    }
-    .btn.danger{
-      background: rgba(244,63,94,.12);
-      border:1px solid rgba(244,63,94,.25);
-    }
-    .table-wrap{
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      overflow:hidden;
-      background: rgba(2,6,23,.35);
-    }
-    table{width:100%;border-collapse:separate;border-spacing:0}
-    th,td{padding:12px 12px;border-bottom:1px solid rgba(148,163,184,.12);text-align:left;vertical-align:top}
-    th{background: rgba(2,6,23,.60);position: sticky;top:0;z-index:1;font-size:.86rem}
-    tr:hover td{background: rgba(2,6,23,.28)}
-    .hint{font-size:.85rem;color:var(--muted);margin-top:8px}
-    @media (max-width: 860px){
-      .row{grid-template-columns: 1fr}
-    }
-
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1><span class="logo">IG</span>Painel do Bot</h1>
-    <div class="subtitle">
-      Funil automático no topo. Confirmação de agenda abaixo.
-      <br/><small>Envio somente entre ${START_HOUR}:00 e ${END_HOUR}:00.</small>
-    </div>
-
-        <div class=\"nav\">
-      <a class=\"navbtn\" href=\"/admin/chat\">💬 Conversas em tempo real</a>
-    </div>
-
-    <form method="POST" action="/admin/mensajes">
-      <!-- =============== FUNIL (TOP) =============== -->
-      <h2 style="margin:0 0 8px 0;">✅ Funil automático (3, 5, 7, 15 dias e a cada 30 dias)</h2>
-      <div class="grid">
-        <div class="card">
-          <h2>Etapa 1 • 3 dias</h2>
-          <small>Primeiro lembrete após sua mensagem.</small>
-          <label for="step0">Mensagem:</label>
-          <textarea id="step0" name="step0">${htmlEscape(m.step0)}</textarea>
-        </div>
-
-        <div class="card">
-          <h2>Etapa 2 • 5 dias</h2>
-          <small>Segundo lembrete.</small>
-          <label for="step1">Mensagem:</label>
-          <textarea id="step1" name="step1">${htmlEscape(m.step1)}</textarea>
-        </div>
-
-        <div class="card">
-          <h2>Etapa 3 • 7 dias</h2>
-          <small>Terceiro lembrete.</small>
-          <label for="step2">Mensagem:</label>
-          <textarea id="step2" name="step2">${htmlEscape(m.step2)}</textarea>
-        </div>
-
-        <div class="card">
-          <h2>Etapa 4 • 15 dias</h2>
-          <small>Último lembrete da primeira sequência.</small>
-          <label for="step3">Mensagem:</label>
-          <textarea id="step3" name="step3">${htmlEscape(m.step3)}</textarea>
-        </div>
-
-        <div class="card" style="grid-column:1/-1;">
-          <h2>Seguimento recorrente • a cada 30 dias</h2>
-          <small>Depois dos 15 dias.</small>
-          <label for="extra">Mensagem:</label>
-          <textarea id="extra" name="extra">${htmlEscape(m.extra)}</textarea>
-        </div>
-
-        <div class="card" style="grid-column:1/-1;">
-          <h2>Pós-venda • a cada 30 dias (clientes já instalados)</h2>
-          <small>Mensagem enviada 30 dias após a instalação e depois a cada 30 dias, para pedir indicação e manter relacionamento.</small>
-          <label for="postSale30">Mensagem:</label>
-          <textarea id="postSale30" name="postSale30">${htmlEscape(m.postSale30 || '')}</textarea>
-        </div>
-
-        <div class="card" style="grid-column:1/-1; margin-top:10px;">
-          <h2>📆 Mensagem programada (primeiro contato)</h2>
-          <small>
-            Use quando o cliente disse que só poderá falar em uma data futura.
-            O funil pausa até esse dia e, quando essa mensagem for enviada, ele entra no funil normalmente.
-          </small>
-
-          <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:10px;">
-            <div style="flex:1; min-width:180px;">
-              <label for="programPhone">Número do cliente</label>
-              <input id="programPhone" name="programPhone" placeholder="Ex: 5511999999999" />
-            </div>
-            <div style="flex:1; min-width:160px;">
-              <label for="programDate">Dia para enviar</label>
-              <input id="programDate" name="programDate" type="date" />
-            </div>
-            <div style="flex:1; min-width:120px;">
-              <label for="programTime">Hora para enviar</label>
-              <input id="programTime" name="programTime" type="time" />
-            </div>
-          </div>
-
-          <label for="programText" style="margin-top:10px;">Mensagem a ser enviada nesse dia</label>
-          <textarea id="programText" name="programText" placeholder="Ex: Oi! Aqui é da Iron Glass, combinamos de falar agora em fevereiro sobre seu carro..."></textarea>
-
-          <div style="margin-top:12px;">
-            <button type="submit" formaction="/admin/program" formmethod="POST">
-              Programar mensagem
-            </button>
-          </div>
-
-          <div style="margin-top:16px;">
-            <h3 style="margin:0 0 4px 0; font-size:.9rem;">Mensagens programadas</h3>
-            <small style="color:#9ca3af;">Clientes que vão receber o primeiro contato em uma data futura.</small>
-            <div style="margin-top:8px;">
-              ${programList}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="footer">
-        <div class="status">
-          <div class="badge"><span class="badge-dot"></span> Bot precisa estar rodando no CMD (npm start)</div>
-        </div>
-        <button type="submit">Salvar mensagens do funil</button>
-      </div>
-
-      <hr style="border:0;border-top:1px solid #1f2937;margin:22px 0;" />
-
-      <!-- =============== AGENDA (BOTTOM) =============== -->
-      <h2 style="margin:0 0 8px 0;">📅 Confirmación de agenda</h2>
-
-      <div class="card" style="grid-column:1/-1;">
-          <label for="phone">Número do cliente</label>
-          <input id="phone" name="phone" placeholder="Ex: 5511999999999" />
-
-          <div style="display:flex; gap:12px; flex-wrap: wrap; margin-top:10px;">
-            <div style="flex:1; min-width:160px;">
-              <label for="date">Dia da agenda</label>
-              <div class="picker">
-                <input id="date" name="date" type="date" />
-                <button type="button" class="icon-btn" onclick="openDate()" aria-label="Abrir calendário">📅</button>
-              </div>
-            </div>
-            <div style="flex:1; min-width:120px;">
-              <label for="time">Hora da agenda</label>
-              <div class="picker">
-                <input id="time" name="time" type="time" />
-                <button type="button" class="icon-btn" onclick="openTime()" aria-label="Abrir relógio">⏰</button>
-              </div>
-            </div>
-          </div>
-
-          <div style="display:flex; gap:12px; flex-wrap: wrap; margin-top:10px;">
-            <div style="flex:1; min-width:220px;">
-              <label for="vehicle">Veículo</label>
-              <input id="vehicle" name="vehicle" placeholder="Ex: BYD SONG" />
-            </div>
-            <div style="flex:1; min-width:220px;">
-              <label for="product">Produto</label>
-              <input id="product" name="product" placeholder="Ex: Iron Glass Plus" />
-            </div>
-            <div style="flex:1; min-width:180px;">
-              <label for="valor">Valor total</label>
-              <input id="valor" name="valor" placeholder="Ex: R$ 12.900,00" />
-            </div>
-            <div style="flex:1; min-width:180px;">
-              <label for="sinal">Sinal recebido</label>
-              <input id="sinal" name="sinal" placeholder="Ex: R$ 1.075,00" />
-            </div>
-            <div style="flex:1; min-width:180px;">
-              <label for="pagamento">Forma de pagamento</label>
-              <input id="pagamento" name="pagamento" placeholder="PIX confirmado" />
-            </div>
-          </div>
-
-          <label style="display:flex;align-items:center;gap:6px;margin-top:8px;">
-            <input type="checkbox" name="sendConfirm" />
-            Enviar mensagem de confirmação agora
-          </label>
-
-          <div style="margin-top:12px;">
-            <button type="submit" formaction="/admin/agenda" formmethod="POST">Programar lembretes</button>
-          </div>
-      </div>
-
-      <div class="grid" style="margin-top:14px;">
-        <div class="card">
-          <h2>Confirmación • 7 dias antes</h2>
-          <label for="agenda0">Mensagem:</label>
-          <textarea id="agenda0" name="agenda0">${htmlEscape(m.agenda0 || '')}</textarea>
-        </div>
-
-        <div class="card">
-          <h2>Confirmación • 3 dias antes</h2>
-          <label for="agenda1">Mensagem:</label>
-          <textarea id="agenda1" name="agenda1">${htmlEscape(m.agenda1 || '')}</textarea>
-        </div>
-
-        <div class="card">
-          <h2>Confirmación • 1 dia antes</h2>
-          <label for="agenda2">Mensagem:</label>
-          <textarea id="agenda2" name="agenda2">${htmlEscape(m.agenda2 || '')}</textarea>
-        </div>
-
-        <div class="card" style="grid-column:1/-1;">
-          <h2>Template de mensagem de confirmação</h2>
-          <small>Variáveis: {{DATA}}, {{HORA}}, {{VEICULO}}, {{PRODUTO}}, {{VALOR}}, {{SINAL}}, {{PAGAMENTO}}</small>
-          <label for="confirmTemplate">Mensagem:</label>
-          <textarea id="confirmTemplate" name="confirmTemplate">${htmlEscape(m.confirmTemplate || '')}</textarea>
-        </div>
-
-        <div class="card" style="grid-column:1/-1; margin-top:10px;">
-          <h2 style="margin-top:0;">Agendas confirmadas</h2>
-          <small style="color:#9ca3af;">Clientes com lembretes de confirmação ativos.</small>
-          <div style="margin-top:10px;">
-            ${agendasList}
-          </div>
-        </div>
-      </div>
-
-      <div class="footer">
-        <button type="submit">Salvar mensagens de agenda</button>
-      </div>
-    </form>
-  </div>
-
-  <script>
-    function openDate(){
-      const el = document.getElementById('date');
-      if(!el) return;
-      if (el.showPicker) el.showPicker();
-      else el.focus();
-    }
-    function openTime(){
-      const el = document.getElementById('time');
-      if(!el) return;
-      if (el.showPicker) el.showPicker();
-      else el.focus();
-    }
-  </script>
-</body>
-</html>
-  `;
-  res.send(html);
-});
-
-// salva textos funil + agenda + template
-app.post('/admin/mensajes', (req, res) => {
-  messagesConfig.step0 = req.body.step0 || messagesConfig.step0;
-  messagesConfig.step1 = req.body.step1 || messagesConfig.step1;
-  messagesConfig.step2 = req.body.step2 || messagesConfig.step2;
-  messagesConfig.step3 = req.body.step3 || messagesConfig.step3;
-  messagesConfig.extra = req.body.extra || messagesConfig.extra;
-  messagesConfig.postSale30 = req.body.postSale30 || messagesConfig.postSale30;
-
-
-  messagesConfig.agenda0 = req.body.agenda0 || messagesConfig.agenda0;
-  messagesConfig.agenda1 = req.body.agenda1 || messagesConfig.agenda1;
-  messagesConfig.agenda2 = req.body.agenda2 || messagesConfig.agenda2;
-
-  messagesConfig.confirmTemplate = req.body.confirmTemplate || messagesConfig.confirmTemplate;
-
-  saveMessages();
-  console.log('[PAINEL] Mensagens atualizadas.');
-  const returnTab = (req.body.returnTab || 'funil');
-  res.redirect('/admin?tab=' + encodeURIComponent(returnTab));
-});
-
-// agenda via painel (programa 7/3/1 e opcionalmente envia confirmação)
-app.post('/admin/agenda', async (req, res) => {
-  const phone = (req.body.phone || '').replace(/\D/g, '');
-  const date = req.body.date;
-  const time = req.body.time;
-
-  if (!phone || !date || !time) return res.redirect('/admin?tab=agenda');
-
-  const jid = phone.startsWith('55') ? `${phone}@s.whatsapp.net` : `55${phone}@s.whatsapp.net`;
-  const apptTs = new Date(`${date}T${time}:00`).getTime();
-
-  // Monta dados completos da agenda (iguais ao template de confirmação)
-  const d = new Date(apptTs);
-  const dd = String(d.getDate()).padStart(2,'0');
-  const mm = String(d.getMonth()+1).padStart(2,'0');
-  const yyyy = d.getFullYear();
-  const hh = String(d.getHours()).padStart(2,'0');
-  const min = String(d.getMinutes()).padStart(2,'0');
-
-  const data = {
-    DATA: `${dd}/${mm}/${yyyy}`,
-    HORA: `${hh}:${min}`,
-    VEICULO: req.body.vehicle || '',
-    PRODUTO: req.body.product || '',
-    VALOR: req.body.valor || '',
-    SINAL: req.body.sinal || '',
-    PAGAMENTO: req.body.pagamento || ''
-  };
-
-  // Sempre programa lembretes já com os dados salvos
-  scheduleAgenda(jid, apptTs, data);
-
-  // Opcionalmente envia confirmação agora
-  if (req.body.sendConfirm) {
-    const text = applyTemplate(messagesConfig.confirmTemplate, data);
-
-    if (sock && isConnected && text) {
-      try {
-        await sendText(jid, text);
-        console.log('[AGENDA] Confirmação enviada pelo painel ->', jid);
-      } catch (e) {
-        console.error('[ERRO] Ao enviar confirmação pelo painel', e);
-      }
-    }
-  }
-
-  res.redirect('/admin?tab=agenda');
-});
-
-// cancelar agenda pelo painel
-app.post('/admin/agenda/delete', (req, res) => {
-  const jid = req.body.jid;
-  cancelAgenda(jid);
-  res.redirect('/admin?tab=confirm');
-});
-
-
-// programar primeira mensagem do funil via painel
-app.post('/admin/program', (req, res) => {
-  const phoneRaw = req.body.programPhone || '';
-  const date = req.body.programDate;
-  const time = req.body.programTime || '09:00';
-  const text = (req.body.programText || '').trim();
-
-  const phone = phoneRaw.replace(/\D/g, '');
-  if (!phone || !date) return res.redirect('/admin?tab=program');
-
-  const jid = phone.startsWith('55')
-    ? `${phone}@s.whatsapp.net`
-    : `55${phone}@s.whatsapp.net`;
-
-  const ts = new Date(`${date}T${time || '09:00'}:00`).getTime();
-  if (!ts || Number.isNaN(ts)) return res.redirect('/admin?tab=program');
-
-  scheduledStarts[jid] = {
-    at: ts,
-    text,
-  };
-  saveProgramados();
-
-  // pausa o funil até a data programada, mas não bloqueia definitivo
-  pauseFollowUp(jid);
-
-  // permite re-enfileirar quando chegar a data
-  scheduledQueue.delete(jid);
-
-  console.log('[PROGRAM] Mensagem inicial programada para', jid, 'em', new Date(ts).toISOString());
-  res.redirect('/admin?tab=program');
-});
-
-// cancelar mensagem programada
-app.post('/admin/program/delete', (req, res) => {
-  const jid = req.body.jid;
-  if (jid && scheduledStarts[jid]) {
-    delete scheduledStarts[jid];
-    saveProgramados();
-    scheduledQueue.delete(jid);
-    console.log('[PROGRAM] Mensagem programada cancelada ->', jid);
-  }
-  res.redirect('/admin?tab=program');
-});
 
 // =================== START ===================
 
@@ -2784,8 +3594,8 @@ startScheduleChecker();
 startMessageSender();
 startBot();
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🌐 Painel web disponível em http://localhost:${PORT}/admin`);
-  console.log(`💬 Conversas ao vivo em http://localhost:${PORT}/admin/chat`);
+  console.log(`💬 Conversas ao vivo em http://localhost:${PORT}/admin?tab=chat`);
 });
