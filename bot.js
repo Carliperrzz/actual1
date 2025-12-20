@@ -443,6 +443,10 @@ function isInsideWindow(ts) {
   return h >= START_HOUR && h < END_HOUR;
 }
 
+function isGroupJid(jid) {
+  return typeof jid === 'string' && jid.endsWith('@g.us');
+}
+
 function cleanText(t) {
   if (!t) return '';
   return t.replace(/\u200b/g, '').replace(/\s+/g, ' ').trim();
@@ -2864,6 +2868,7 @@ function startScheduleChecker() {
     for (const [jid, c] of Object.entries(clients)) {
       if (blocked[jid]) continue;
       if (paused[jid]) continue;
+      if (isGroupJid(jid)) continue;
       if (!c.nextFollowUpAt) continue;
       if (now >= c.nextFollowUpAt) {
         const already = messageQueue.some(
@@ -2881,6 +2886,7 @@ function startScheduleChecker() {
     for (const [jid, c] of Object.entries(clients)) {
       if (blocked[jid]) continue;
       if (paused[jid]) continue;
+      if (isGroupJid(jid)) continue;
       if (!c.postSaleStartAt) continue;
       if (now >= c.postSaleStartAt) {
         console.log('[POS] Iniciando pós-venda automático para', jid);
@@ -2892,6 +2898,7 @@ function startScheduleChecker() {
 
     // agenda
     for (const [jid, arr] of Object.entries(agendas)) {
+      if (isGroupJid(jid)) continue;
       if (!Array.isArray(arr)) continue;
       for (const item of arr) {
         if (now >= item.at) {
@@ -2908,6 +2915,7 @@ function startScheduleChecker() {
 
     // mensagens iniciais programadas
     for (const [jid, s] of Object.entries(scheduledStarts || {})) {
+      if (isGroupJid(jid)) continue;
       if (!s || !s.at) continue;
 
       if (now >= s.at) {
@@ -2949,6 +2957,16 @@ function startMessageSender() {
 
     try {
       const { jid, kind, key } = item;
+
+      if (isGroupJid(jid)) {
+        console.log('[SKIP] Ignorando grupo (sem automação):', jid);
+        if (clients[jid]) { delete clients[jid]; saveClients(); }
+        if (agendas[jid]) { delete agendas[jid]; saveAgendas(); }
+        if (paused[jid]) { delete paused[jid]; savePaused(); }
+        if (scheduledStarts[jid]) { delete scheduledStarts[jid]; saveProgramados(); }
+        scheduledQueue.delete(jid);
+        return;
+      }
 
       if (kind === 'funil') {
         const c = clients[jid];
@@ -3293,6 +3311,7 @@ function setupMessageHandler() {
     if (
       !remoteJid ||
       remoteJid === 'status@broadcast' ||
+      remoteJid.endsWith('@g.us') || // grupos (ignorar)
       remoteJid.endsWith('@newsletter') ||
       msg.key.remoteJid === 'status@broadcast'
     ) {
