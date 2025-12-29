@@ -611,7 +611,9 @@ function setupMessageHandler() {
 
     // --------- MINHA MSG (SOMENTE VOCÊ CONTROLA STOP/PAUSE/AGENDA) ---------
     if (fromMe) {
-      if (botSentRecently.has(jid)) {
+      // ✅ deixa seus comandos funcionarem mesmo se o bot enviou mensagem recentemente
+      const isCmd = lower.includes(CMD_STOP) || lower.includes(CMD_PAUSE) || lower.includes(CMD_CLIENT);
+      if (botSentRecently.has(jid) && !isCmd) {
         console.log('[BOT MSG] Ignorada (botSentRecently) ->', jid);
         return;
       }
@@ -796,6 +798,10 @@ async function startBot() {
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// Railway/health
+app.get('/', (req, res) => res.redirect('/admin'));
+app.get('/health', (req, res) => res.status(200).send('ok'));
 
 function htmlEscape(str) {
   if (!str) return '';
@@ -1367,7 +1373,7 @@ startScheduleChecker();
 startMessageSender();
 startBot();
 
-const PORT = 3000;
-app.listen(PORT, () => {
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Painel web disponível em http://localhost:${PORT}/admin`);
 });
