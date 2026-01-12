@@ -45,7 +45,7 @@ const PROGRAM_FILE = path.join(__dirname, 'programados.json');
 
 let clients = {};
 let messagesConfig = {};
-let blocked = { phones: {}, legacy: {} };
+let blocked = {};
 let paused = {};
 let agendas = {};
 let scheduledStarts = {};
@@ -74,71 +74,10 @@ function saveJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
-// =================== BLOCK HELPERS (PHONE-BASED) ===================
-
-// Normaliza um JID padrão (@s.whatsapp.net) para chave de telefone (somente dígitos)
-function normalizePhoneKeyFromJid(jid) {
-  if (!jid || typeof jid !== 'string') return null;
-  if (!jid.includes('@')) return null;
-  if (!jid.endsWith('@s.whatsapp.net')) return null;
-  const raw = jid.split('@')[0];
-  const digits = String(raw).replace(/\D/g, '');
-  return digits || null;
-}
-
-// Extrai uma chave de telefone a partir da mensagem (cobre casos @lid)
-function getPhoneKeyFromMsg(msg, jid) {
-  // 1) pelo JID normal
-  const byJid = normalizePhoneKeyFromJid(jid);
-  if (byJid) return byJid;
-
-  // 2) Baileys pode trazer senderPn (geralmente só números)
-  const spn = msg?.key?.senderPn;
-  if (spn) {
-    const digits = String(spn).replace(/\D/g, '');
-    if (digits.length >= 10) {
-      return digits.startsWith('55') ? digits : ('55' + digits);
-    }
-  }
-
-  // 3) participant às vezes vem como @s.whatsapp.net
-  const part = msg?.key?.participant;
-  const byPart = normalizePhoneKeyFromJid(part);
-  if (byPart) return byPart;
-
-  return null;
-}
-
-// Migra bloqueados antigos (flat) para estrutura { phones, legacy } sem perder nada
-function migrateBlockedStructure(raw) {
-  if (!raw || typeof raw !== 'object') return { phones: {}, legacy: {} };
-
-  // já no formato novo
-  if (raw.phones && raw.legacy && typeof raw.phones === 'object' && typeof raw.legacy === 'object') {
-    return raw;
-  }
-
-  const out = { phones: {}, legacy: {} };
-  for (const [k, v] of Object.entries(raw)) {
-    const phoneKey = normalizePhoneKeyFromJid(k);
-    if (phoneKey) out.phones[phoneKey] = v;
-    else out.legacy[k] = v; // mantém @lid, @newsletter etc como fallback
-  }
-  return out;
-}
-
-function isBlocked(jid, phoneKey) {
-  if (phoneKey && blocked?.phones?.[phoneKey]) return true;
-  if (jid && blocked?.legacy?.[jid]) return true; // compatibilidade
-  return false;
-}
-
 function loadAll() {
   clients = loadJSON(DATA_FILE, {});
   messagesConfig = loadJSON(MSG_FILE, defaultMessages());
-  blocked = migrateBlockedStructure(loadJSON(BLOCK_FILE, {}));
-  // garante formato novo persistido
-  saveBlocked();
+  blocked = loadJSON(BLOCK_FILE, {});
   paused = loadJSON(PAUSE_FILE, {});
   agendas = loadJSON(AGENDA_FILE, {});
   scheduledStarts = loadJSON(PROGRAM_FILE, {});
@@ -267,8 +206,7 @@ function parseAgendaConfirmation(text) {
 // =================== FUNIL ===================
 
 function startFollowUp(jid) {
-  const phoneKey = normalizePhoneKeyFromJid(jid);
-  if (isBlocked(jid, phoneKey)) return; // nunca reinicia pra bloqueado definitivo
+  if (blocked[jid]) return; // nunca reinicia pra bloqueado definitivo
 
   const now = Date.now();
   clients[jid] = {
@@ -282,8 +220,7 @@ function startFollowUp(jid) {
 }
 
 function startPostSaleMonthly(jid) {
-  const phoneKey = normalizePhoneKeyFromJid(jid);
-  if (isBlocked(jid, phoneKey)) return;
+  if (blocked[jid]) return;
 
   const now = Date.now();
   const c = clients[jid] || {};
@@ -324,11 +261,9 @@ function pauseFollowUp(jid) {
   console.log('[FUNIL] Pausado para', jid);
 }
 
-function blockFollowUp(jid, phoneKey, reason = 'STOP') {
+function blockFollowUp(jid, reason = 'STOP') {
   // Marca como bloqueado DEFINITIVO: não entra mais em nenhum fluxo (funil, agenda, mensal, programados)
-  const pk = phoneKey || normalizePhoneKeyFromJid(jid);
-  if (pk) blocked.phones[pk] = { blockedAt: Date.now(), reason };
-  else blocked.legacy[jid] = { blockedAt: Date.now(), reason };
+  blocked[jid] = { blockedAt: Date.now(), reason };
   saveBlocked();
 
   // Pausa e remove funil
@@ -414,8 +349,7 @@ function startScheduleChecker() {
 
     // funil
     for (const [jid, c] of Object.entries(clients)) {
-      const phoneKey = normalizePhoneKeyFromJid(jid);
-      if (isBlocked(jid, phoneKey)) continue;
+      if (blocked[jid]) continue;
       if (paused[jid]) continue;
       if (!c.nextFollowUpAt) continue;
       if (now >= c.nextFollowUpAt) {
@@ -429,8 +363,6 @@ function startScheduleChecker() {
 
     // agenda
     for (const [jid, arr] of Object.entries(agendas)) {
-      const phoneKey = normalizePhoneKeyFromJid(jid);
-      if (isBlocked(jid, phoneKey)) continue;
       if (!Array.isArray(arr)) continue;
       for (const item of arr) {
         if (now >= item.at) {
@@ -448,11 +380,6 @@ function startScheduleChecker() {
       if (!s || !s.at) continue;
 
       if (now >= s.at) {
-        const phoneKey = normalizePhoneKeyFromJid(jid);
-        if (isBlocked(jid, phoneKey)) {
-          // não enfileira nem envia se o telefone estiver bloqueado
-          continue;
-        }
         const already = messageQueue.some(m => m.jid === jid && m.kind === 'startFunil');
         if (!already && !scheduledQueue.has(jid)) {
           messageQueue.push({ jid, kind: 'startFunil' });
@@ -495,12 +422,6 @@ function startMessageSender() {
 
     try {
       const { jid, kind, key } = item;
-      const phoneKey = normalizePhoneKeyFromJid(jid);
-      if (isBlocked(jid, phoneKey)) {
-        console.log('[BLOCK] Ignorando envio para bloqueado ->', jid);
-        sendingNow = false;
-        return;
-      }
 
       if (kind === 'funil') {
         const c = clients[jid];
@@ -610,8 +531,7 @@ function startMessageSender() {
           return;
         }
 
-        const phoneKey = normalizePhoneKeyFromJid(jid);
-        if (isBlocked(jid, phoneKey)) {
+        if (blocked[jid]) {
           console.log('[PROGRAM] Cliente bloqueado; ignorando mensagem programada ->', jid);
           delete scheduledStarts[jid];
           saveProgramados();
@@ -673,8 +593,6 @@ function setupMessageHandler() {
       remoteJid.endsWith('@newsletter')
     ) return;
 
-    const phoneKey = getPhoneKeyFromMsg(msg, jid);
-
     // ✅ IGNORAR HISTÓRICO / REPLAY
     const msgMs = getMsgMs(msg);
     if (Date.now() - msgMs > RECENT_WINDOW_MS) {
@@ -703,7 +621,7 @@ function setupMessageHandler() {
       // comandos manuais SEMPRE antes do ignoreNextFromMe
       if (lower.includes(CMD_STOP)) {
         if (c && c.ignoreNextFromMe) { c.ignoreNextFromMe = false; saveClients(); }
-        blockFollowUp(jid, phoneKey, 'MANUAL_STOP');
+        blockFollowUp(jid, 'MANUAL_STOP');
         return;
       }
       if (lower.includes(CMD_PAUSE)) {
@@ -751,7 +669,7 @@ function setupMessageHandler() {
         return;
       }
 
-      if (!isBlocked(jid, phoneKey)) {
+      if (!blocked[jid]) {
         // Se o cliente tem agenda ativa, NÃO reinicia funil normal.
         if (agendas[jid] && Array.isArray(agendas[jid]) && agendas[jid].length > 0) {
           console.log('[MINHA MSG] Cliente com agenda ativa; não reinicia funil ->', jid);
@@ -768,7 +686,7 @@ function setupMessageHandler() {
 
     // ❌ REMOVIDO auto-stop por palavras do cliente (para não sair por acidente)
 
-    if (isBlocked(jid, phoneKey)) return;
+    if (blocked[jid]) return;
 
     // PAUSA de 72h: enquanto durar a janela, não reinicia funil nem entra em novos fluxos
     if (paused[jid]) {
@@ -834,6 +752,7 @@ async function startBot() {
       version,
       auth: state,
       logger: P({ level: 'error' }),
+      markOnlineOnConnect: false,
     });
 
     console.log('✅ Bot inicializado. Aguardando QR para conexão...');
@@ -854,6 +773,13 @@ async function startBot() {
         isConnected = true;
         reconnectAttempts = 0;
         console.log('✅ Conectado ao WhatsApp!');
+
+        try {
+          // ✅ Mantém o bot sempre indisponível/offline
+          await sock.sendPresenceUpdate('unavailable');
+        } catch (e) {
+          console.log('[PRESENCE] Não pude forçar unavailable:', e?.message || e);
+        }
       } else if (connection === 'close') {
         isConnected = false;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -1353,10 +1279,7 @@ app.post('/admin/agenda', async (req, res) => {
 
   if (!phone || !date || !time) return res.redirect('/admin');
 
-  const phoneKey = phone.startsWith('55') ? phone : `55${phone}`;
-  if (blocked?.phones?.[phoneKey]) return res.redirect('/admin');
-
-  const jid = phoneKey + '@s.whatsapp.net';
+  const jid = phone.startsWith('55') ? `${phone}@s.whatsapp.net` : `55${phone}@s.whatsapp.net`;
   const apptTs = new Date(`${date}T${time}:00`).getTime();
 
   // Monta dados completos da agenda (iguais ao template de confirmação)
@@ -1416,10 +1339,9 @@ app.post('/admin/program', (req, res) => {
   const phone = phoneRaw.replace(/\D/g, '');
   if (!phone || !date) return res.redirect('/admin');
 
-  const phoneKey = phone.startsWith('55') ? phone : ('55' + phone);
-  if (blocked?.phones?.[phoneKey]) return res.redirect('/admin');
-
-  const jid = phoneKey + '@s.whatsapp.net';
+  const jid = phone.startsWith('55')
+    ? `${phone}@s.whatsapp.net`
+    : `55${phone}@s.whatsapp.net`;
 
   const ts = new Date(`${date}T${time || '09:00'}:00`).getTime();
   if (!ts || Number.isNaN(ts)) return res.redirect('/admin');
@@ -1458,6 +1380,17 @@ loadAll();
 startScheduleChecker();
 startMessageSender();
 startBot();
+
+// =================== PRESENCE (OFFLINE) ===================
+// Mantém o bot como "indisponível" (offline) para não aparecer online.
+const PRESENCE_KEEP_OFFLINE = 2 * 60 * 1000;
+setInterval(async () => {
+  if (!sock || !isConnected) return;
+  try {
+    await sock.sendPresenceUpdate('unavailable');
+  } catch (_) {}
+}, PRESENCE_KEEP_OFFLINE);
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
